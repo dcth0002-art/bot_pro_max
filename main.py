@@ -2,27 +2,43 @@
 import numpy as np
 import pandas as pd
 import ccxt
+import time
 from environment import TradingEnvironment
 from agent import Agent
 from config import (MODEL_SAVE_PATH, STATE_SIZE, 
                     TARGET_BALANCE, STARTING_BALANCE, TIMEFRAME)
 import os
 from firebase_storage import initialize_firebase, upload_model_to_firebase, download_model_from_firebase
-# Import các hàm từ telegram_reporter
 from telegram_reporter import initialize_telegram_bot, send_telegram_message
 
 FIREBASE_MODEL_NAME = "trading_bot_model.h5" 
 
-def fetch_data(symbol, timeframe, limit=1000):
-    try:
-        exchange = ccxt.binance()
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
-    except Exception as e:
-        print(f"Lỗi khi tải dữ liệu: {e}")
-        return None
+def fetch_data(symbol, timeframe, limit=1000, max_retries=3):
+    """
+    Tải dữ liệu lịch sử từ sàn giao dịch với cơ chế thử lại.
+    """
+    for attempt in range(max_retries):
+        try:
+            print(f"Đang cố gắng tải dữ liệu (lần {attempt + 1}/{max_retries})...")
+            exchange = ccxt.binance({
+                'enableRateLimit': True, # Tự động xử lý rate limit của sàn
+                'options': {
+                    'adjustForTimeDifference': True,
+                },
+            })
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            print("--- Tải dữ liệu thành công! ---")
+            return df
+        except Exception as e:
+            error_message = f"Lỗi khi tải dữ liệu lần {attempt + 1}: {e}"
+            print(error_message)
+            # Gửi lỗi chi tiết qua Telegram
+            send_telegram_message(f"⚠️ {error_message}")
+            if attempt < max_retries - 1:
+                time.sleep(5)  # Chờ 5 giây trước khi thử lại
+    return None
 
 def train_bot(episodes):
     # Khởi tạo các dịch vụ
@@ -36,7 +52,7 @@ def train_bot(episodes):
     symbol = 'BTC/USDT'
     data = fetch_data(symbol, TIMEFRAME)
     if data is None:
-        send_telegram_message(" Lỗi nghiêm trọng: Không thể tải dữ liệu giá. Bot sẽ dừng lại.")
+        send_telegram_message("❌ Lỗi nghiêm trọng: Không thể tải dữ liệu giá sau nhiều lần thử. Bot sẽ dừng lại.")
         return
 
     # 2. Khởi tạo Agent
@@ -62,7 +78,7 @@ def train_bot(episodes):
             initial_message = "Không tìm thấy trí nhớ, bắt đầu học từ đầu."
             
     print(initial_message)
-    send_telegram_message(f" Bắt đầu phiên làm việc mới.\n{initial_message}")
+    send_telegram_message(f"▶️ Bắt đầu phiên làm việc mới.\n{initial_message}")
 
     # 3. Vòng lặp huấn luyện
     for e in range(episodes):
