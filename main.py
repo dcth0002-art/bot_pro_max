@@ -33,7 +33,7 @@ def train_bot(episodes):
     firebase_initialized = initialize_firebase()
     initialize_telegram_bot()
 
-    send_telegram_message("🤖 Bot Trading Pro Max đã khởi động!")
+    send_telegram_message("🤖 Bot Trading Pro Max đã khởi động (Chế độ lưu 50 tập/lần)!")
 
     data = fetch_data()
     if data is None:
@@ -84,27 +84,31 @@ def train_bot(episodes):
             if step_counter % 50 == 0:
                 print(f"Tập {e+1}: Bước {step_counter}, Số dư: ${env.balance:.2f}")
 
-        # --- KẾT THÚC TẬP: BẮT ĐẦU HỌC VÀ LƯU ---
+        # --- KẾT THÚC TẬP ---
         
-        print(f"--- Đang huấn luyện (Replay) cho Tập {e+1}... ---")
-        agent.replay() # Học nhanh nhờ Vectorized Replay đã sửa ở agent.py
+        # Vẫn cho bot học sau mỗi tập để tích lũy kiến thức liên tục
+        agent.replay() 
         
-        if e % 5 == 0:
+        if (e + 1) % 5 == 0:
             agent.update_target_model()
 
-        # Lưu xuống ổ đĩa ảo của server
-        agent.save(MODEL_SAVE_PATH)
-        
-        summary_message = (f"✅ Hoàn thành Tập {e+1}/{episodes}:\n"
-                           f"   - Lợi nhuận: ${total_profit:.4f}\n"
-                           f"   - Số dư cuối: ${env.balance:.2f}\n"
-                           f"   - Epsilon: {agent.epsilon:.4f}")
-        send_telegram_message(summary_message)
+        # CHỈ LƯU TRÍ NHỚ VÀ GỬI TIN NHẮN TELEGRAM MỖI 50 TẬP
+        if (e + 1) % 50 == 0:
+            # Lưu xuống ổ đĩa ảo của server
+            agent.save(MODEL_SAVE_PATH)
+            
+            summary_message = (f"📊 Báo cáo định kỳ (Tập {e+1}/{episodes}):\n"
+                               f"   - Lợi nhuận tập này: ${total_profit:.4f}\n"
+                               f"   - Số dư hiện tại: ${env.balance:.2f}\n"
+                               f"   - Epsilon: {agent.epsilon:.4f}")
+            send_telegram_message(summary_message)
 
-        # Tải lên Firebase
-        if firebase_initialized:
-            upload_model_to_firebase(MODEL_SAVE_PATH, FIREBASE_MODEL_NAME)
-            send_telegram_message(f"💾 Đã sao lưu trí nhớ Tập {e+1} lên Firebase.")
+            # Tải lên Firebase
+            if firebase_initialized:
+                upload_model_to_firebase(MODEL_SAVE_PATH, FIREBASE_MODEL_NAME)
+                send_telegram_message(f"💾 Đã sao lưu trí nhớ Tập {e+1} lên Firebase.")
+            
+            print(f"--- Đã lưu và báo cáo tại tập {e+1} ---")
 
         if env.balance >= TARGET_BALANCE:
             send_telegram_message("🏆 ĐÃ ĐẠT MỤC TIÊU! Dừng bot.")
