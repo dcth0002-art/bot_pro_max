@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
-# import ccxt # Không cần dùng nữa
 import time
 from environment import TradingEnvironment
 from agent import Agent
@@ -12,73 +11,52 @@ from firebase_storage import initialize_firebase, upload_model_to_firebase, down
 from telegram_reporter import initialize_telegram_bot, send_telegram_message
 
 FIREBASE_MODEL_NAME = "trading_bot_model.h5" 
-DATA_FILE_PATH = "btc_usdt_1m_data.csv" # Tên file dữ liệu
+DATA_FILE_PATH = "btc_usdt_1m_data.csv"
 
 def fetch_data():
-    """
-    Đọc dữ liệu lịch sử từ file CSV local.
-    """
     try:
         print(f"Đang đọc dữ liệu từ file {DATA_FILE_PATH}...")
         if not os.path.exists(DATA_FILE_PATH):
-            print(f"Lỗi: Không tìm thấy file dữ liệu '{DATA_FILE_PATH}'.")
-            print("Vui lòng chạy file 'download_data.py' trước.")
             return None
             
         df = pd.read_csv(DATA_FILE_PATH)
-        # --- THAY ĐỔI Ở ĐÂY ---
-        # Lấy 200 dòng đầu tiên để chạy thử nghiệm cho nhanh
+        # Sử dụng 200 nến để huấn luyện (tăng lên để bot có dữ liệu học)
         df_short = df.head(200).copy()
         
-        print("--- Đọc và rút ngắn dữ liệu thành công! ---")
-        print(f"    - Sử dụng {len(df_short)} cây nến để huấn luyện.")
+        print("--- Đọc dữ liệu thành công! ---")
         return df_short
     except Exception as e:
-        error_message = f"Lỗi khi đọc file dữ liệu: {e}"
-        print(error_message)
-        send_telegram_message(f"⚠️ {error_message}")
+        print(f"Lỗi khi đọc file dữ liệu: {e}")
         return None
 
 def train_bot(episodes):
-    # Khởi tạo các dịch vụ
     firebase_initialized = initialize_firebase()
     initialize_telegram_bot()
 
-    # Gửi tin nhắn khởi động
-    send_telegram_message("🤖 Bot Trading Pro Max đã khởi động trên Railway!")
+    send_telegram_message("🤖 Bot Trading Pro Max đã khởi động!")
 
-    # 1. Đọc dữ liệu từ file
     data = fetch_data()
     if data is None:
-        send_telegram_message(f"❌ Lỗi nghiêm trọng: Không thể đọc file dữ liệu '{DATA_FILE_PATH}'. Bot sẽ dừng lại.")
+        send_telegram_message(f"❌ Lỗi: Không thể đọc file dữ liệu.")
         return
 
-    # 2. Khởi tạo Agent
     env = TradingEnvironment(data)
     agent = Agent(state_size=STATE_SIZE * 5)
 
-    # Tải model
-    initial_message = ""
     if firebase_initialized:
         model_downloaded = download_model_from_firebase(FIREBASE_MODEL_NAME, MODEL_SAVE_PATH)
         if model_downloaded:
              agent.load(MODEL_SAVE_PATH)
-             agent.epsilon = agent.epsilon_min
-             initial_message = "Đã tải trí nhớ từ Firebase, bắt đầu học tiếp."
+             agent.epsilon = agent.epsilon_min 
+             msg = "Đã tải trí nhớ từ Firebase."
         else:
-            initial_message = "Không tìm thấy trí nhớ, bắt đầu học từ đầu."
-    else: # Xử lý local
-        if os.path.exists(MODEL_SAVE_PATH):
-            agent.load(MODEL_SAVE_PATH)
-            agent.epsilon = agent.epsilon_min
-            initial_message = "Đã tải trí nhớ từ file local, bắt đầu học tiếp."
-        else:
-            initial_message = "Không tìm thấy trí nhớ, bắt đầu học từ đầu."
+            msg = "Không tìm thấy trí nhớ trên Firebase, học từ đầu."
+    else:
+        msg = "Chạy chế độ Local."
             
-    print(initial_message)
-    send_telegram_message(f"▶️ Bắt đầu phiên làm việc mới.\n{initial_message}")
+    print(msg)
+    send_telegram_message(f"▶️ {msg}")
 
-    # 3. Vòng lặp huấn luyện (Giữ nguyên)
     for e in range(episodes):
         state = env.reset()
         state = np.reshape(state, [1, env.state_size])
@@ -103,43 +81,34 @@ def train_bot(episodes):
             total_profit += reward
             step_counter += 1
 
-            if step_counter % 100 == 0:
-                report_message = (f"📈 Báo cáo nhanh - Tập {e+1}:\n"
-                                  f"   - Đã xử lý {step_counter} bước.\n"
-                                  f"   - Số dư tạm thời: ${env.balance:.2f}")
-                print(report_message)
-                send_telegram_message(report_message)
+            if step_counter % 50 == 0:
+                print(f"Tập {e+1}: Bước {step_counter}, Số dư: ${env.balance:.2f}")
 
-            if done:
-                summary_message = (f"✅ Hoàn thành Tập {e+1}/{episodes}:\n"
-                                   f"   - Lợi nhuận: ${total_profit:.4f}\n"
-                                   f"   - Số dư cuối: ${env.balance:.2f}\n"
-                                   f"   - Epsilon: {agent.epsilon:.4f}")
-                print(summary_message)
-                send_telegram_message(summary_message)
-                
-                if env.balance >= TARGET_BALANCE:
-                    final_message = "🏆 ĐÃ ĐẠT MỤC TIÊU! Bot sẽ dừng lại."
-                    print(final_message)
-                    send_telegram_message(final_message)
-                    agent.save(MODEL_SAVE_PATH)
-                    if firebase_initialized:
-                         upload_model_to_firebase(MODEL_SAVE_PATH, FIREBASE_MODEL_NAME)
-                    return
-
-            agent.replay()
-            
-        if e % 10 == 0:
+        # --- KẾT THÚC TẬP: BẮT ĐẦU HỌC VÀ LƯU ---
+        
+        print(f"--- Đang huấn luyện (Replay) cho Tập {e+1}... ---")
+        agent.replay() # Học nhanh nhờ Vectorized Replay đã sửa ở agent.py
+        
+        if e % 5 == 0:
             agent.update_target_model()
 
-        # Lưu model và tải lên Firebase
+        # Lưu xuống ổ đĩa ảo của server
         agent.save(MODEL_SAVE_PATH)
-        save_message = f"💾 Đã lưu trí nhớ sau Tập {e+1}."
-        print(save_message)
-        send_telegram_message(save_message)
+        
+        summary_message = (f"✅ Hoàn thành Tập {e+1}/{episodes}:\n"
+                           f"   - Lợi nhuận: ${total_profit:.4f}\n"
+                           f"   - Số dư cuối: ${env.balance:.2f}\n"
+                           f"   - Epsilon: {agent.epsilon:.4f}")
+        send_telegram_message(summary_message)
+
+        # Tải lên Firebase
         if firebase_initialized:
             upload_model_to_firebase(MODEL_SAVE_PATH, FIREBASE_MODEL_NAME)
+            send_telegram_message(f"💾 Đã sao lưu trí nhớ Tập {e+1} lên Firebase.")
 
+        if env.balance >= TARGET_BALANCE:
+            send_telegram_message("🏆 ĐÃ ĐẠT MỤC TIÊU! Dừng bot.")
+            break
 
 if __name__ == "__main__":
     NUM_EPISODES = 1000
