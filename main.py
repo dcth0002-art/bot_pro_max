@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
-import ccxt
+# import ccxt # Không cần dùng nữa
 import time
 from environment import TradingEnvironment
 from agent import Agent
@@ -12,32 +12,32 @@ from firebase_storage import initialize_firebase, upload_model_to_firebase, down
 from telegram_reporter import initialize_telegram_bot, send_telegram_message
 
 FIREBASE_MODEL_NAME = "trading_bot_model.h5" 
+DATA_FILE_PATH = "btc_usdt_1m_data.csv" # Tên file dữ liệu
 
-def fetch_data(symbol, timeframe, limit=1000, max_retries=3):
+def fetch_data():
     """
-    Tải dữ liệu lịch sử từ sàn giao dịch với cơ chế thử lại.
+    Đọc dữ liệu lịch sử từ file CSV local.
     """
-    for attempt in range(max_retries):
-        try:
-            print(f"Đang cố gắng tải dữ liệu (lần {attempt + 1}/{max_retries})...")
-            exchange = ccxt.okx({ # <<< THAY ĐỔI Ở ĐÂY
-                'enableRateLimit': True,
-                'options': {
-                    'adjustForTimeDifference': True,
-                },
-            })
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            print("--- Tải dữ liệu thành công! ---")
-            return df
-        except Exception as e:
-            error_message = f"Lỗi khi tải dữ liệu lần {attempt + 1}: {e}"
-            print(error_message)
-            send_telegram_message(f"⚠️ {error_message}")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-    return None
+    try:
+        print(f"Đang đọc dữ liệu từ file {DATA_FILE_PATH}...")
+        if not os.path.exists(DATA_FILE_PATH):
+            print(f"Lỗi: Không tìm thấy file dữ liệu '{DATA_FILE_PATH}'.")
+            print("Vui lòng chạy file 'download_data.py' trước.")
+            return None
+            
+        df = pd.read_csv(DATA_FILE_PATH)
+        # --- THAY ĐỔI Ở ĐÂY ---
+        # Lấy 200 dòng đầu tiên để chạy thử nghiệm cho nhanh
+        df_short = df.head(200).copy()
+        
+        print("--- Đọc và rút ngắn dữ liệu thành công! ---")
+        print(f"    - Sử dụng {len(df_short)} cây nến để huấn luyện.")
+        return df_short
+    except Exception as e:
+        error_message = f"Lỗi khi đọc file dữ liệu: {e}"
+        print(error_message)
+        send_telegram_message(f"⚠️ {error_message}")
+        return None
 
 def train_bot(episodes):
     # Khởi tạo các dịch vụ
@@ -47,11 +47,10 @@ def train_bot(episodes):
     # Gửi tin nhắn khởi động
     send_telegram_message("🤖 Bot Trading Pro Max đã khởi động trên Railway!")
 
-    # 1. Tải dữ liệu
-    symbol = 'BTC/USDT'
-    data = fetch_data(symbol, TIMEFRAME)
+    # 1. Đọc dữ liệu từ file
+    data = fetch_data()
     if data is None:
-        send_telegram_message("❌ Lỗi nghiêm trọng: Không thể tải dữ liệu giá sau nhiều lần thử. Bot sẽ dừng lại.")
+        send_telegram_message(f"❌ Lỗi nghiêm trọng: Không thể đọc file dữ liệu '{DATA_FILE_PATH}'. Bot sẽ dừng lại.")
         return
 
     # 2. Khởi tạo Agent
@@ -79,7 +78,7 @@ def train_bot(episodes):
     print(initial_message)
     send_telegram_message(f"▶️ Bắt đầu phiên làm việc mới.\n{initial_message}")
 
-    # 3. Vòng lặp huấn luyện
+    # 3. Vòng lặp huấn luyện (Giữ nguyên)
     for e in range(episodes):
         state = env.reset()
         state = np.reshape(state, [1, env.state_size])
