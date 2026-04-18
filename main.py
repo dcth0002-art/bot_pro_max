@@ -20,8 +20,8 @@ def fetch_data(symbol, timeframe, limit=1000, max_retries=3):
     for attempt in range(max_retries):
         try:
             print(f"Đang cố gắng tải dữ liệu (lần {attempt + 1}/{max_retries})...")
-            exchange = ccxt.binance({
-                'enableRateLimit': True, # Tự động xử lý rate limit của sàn
+            exchange = ccxt.okx({ # <<< THAY ĐỔI Ở ĐÂY
+                'enableRateLimit': True,
                 'options': {
                     'adjustForTimeDifference': True,
                 },
@@ -34,10 +34,9 @@ def fetch_data(symbol, timeframe, limit=1000, max_retries=3):
         except Exception as e:
             error_message = f"Lỗi khi tải dữ liệu lần {attempt + 1}: {e}"
             print(error_message)
-            # Gửi lỗi chi tiết qua Telegram
             send_telegram_message(f"⚠️ {error_message}")
             if attempt < max_retries - 1:
-                time.sleep(5)  # Chờ 5 giây trước khi thử lại
+                time.sleep(5)
     return None
 
 def train_bot(episodes):
