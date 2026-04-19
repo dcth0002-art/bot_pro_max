@@ -59,13 +59,13 @@ class TradingEnvironment:
         
         step_pnl = self.balance * pnl_pct * leverage
         self.balance += step_pnl
-        reward = pnl_pct * 20 # Tăng hệ số reward PnL để bot nhạy cảm hơn với lãi/lỗ
+        reward = pnl_pct * 20 
 
-        # 2. Xử lý hành động (Giảm phạt vào lệnh để bot tự tin hơn)
+        # 2. Xử lý hành động
         if action == 1 and self.position != 'long': # Mở Long
             self.balance -= self.balance * self.fee 
             self.position = 'long'
-            reward -= 0.02 # Giảm phạt xuống 0.02 thay vì 0.1
+            reward -= 0.02 
         elif action == 2 and self.position != 'short': # Mở Short
             self.balance -= self.balance * self.fee
             self.position = 'short'
@@ -79,8 +79,9 @@ class TradingEnvironment:
         if self.balance >= 600:
             reward += 100 
             self.done = True
-        elif self.balance <= 450:
-            reward -= 150 # Phạt vừa đủ để bot sợ nhưng không bị "sốc"
+        elif self.balance <= 0: # Thay đổi từ 450$ về 0$ theo yêu cầu
+            reward -= 200 # Phạt nặng hơn khi về 0
+            self.balance = 0
             self.done = True
 
         self.current_step += 1
