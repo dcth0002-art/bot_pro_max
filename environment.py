@@ -20,7 +20,11 @@ class TradingEnvironment:
             return None
         start = self.current_step - STATE_SIZE + 1
         end = self.current_step + 1
-        state_data = self.data.iloc[start:end].copy()
+        
+        # Chỉ lấy 5 cột dữ liệu giao dịch, bỏ qua 'timestamp' (cột thứ 1)
+        # để đảm bảo kích thước trả về là STATE_SIZE * 5 = 50
+        cols = ['open', 'high', 'low', 'close', 'volume']
+        state_data = self.data.iloc[start:end][cols].copy()
         
         # CHUẨN HÓA RIÊNG BIỆT:
         # Giá chia cho giá đóng cửa cuối cùng
