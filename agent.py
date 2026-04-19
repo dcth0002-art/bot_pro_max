@@ -68,31 +68,35 @@ class Agent:
     def load(self, name):
         if os.path.exists(name):
             try:
+                # Keras 3 load weights
                 self.model.load_weights(name)
                 self.update_target_model()
                 print(f"--- Đã tải trọng số model từ {name} ---")
             except Exception as e:
-                print(f"Lỗi khi tải trọng số: {e}")
+                print(f"Lỗi khi tải trọng số (có thể do khác kích thước): {e}")
 
     def save(self, name):
         self.model.save_weights(name)
 
-    # --- MỚI: LƯU VÀ TẢI KÝ ỨC (MEMORY) ---
     def save_memory(self, path):
-        """Lưu lại deque memory vào file pickle"""
         try:
             with open(path, 'wb') as f:
                 pickle.dump(self.memory, f)
-            print(f"--- Đã lưu {len(self.memory)} ký ức vào {path} ---")
         except Exception as e:
             print(f"Lỗi lưu ký ức: {e}")
 
     def load_memory(self, path):
-        """Tải lại deque memory từ file pickle"""
         if os.path.exists(path):
             try:
                 with open(path, 'rb') as f:
-                    self.memory = pickle.load(f)
+                    loaded_memory = pickle.load(f)
+                    if len(loaded_memory) > 0:
+                        # KIỂM TRA KÍCH THƯỚC: Nếu không khớp với state_size hiện tại thì bỏ qua
+                        sample_state = loaded_memory[0][0]
+                        if sample_state.shape[1] if len(sample_state.shape) > 1 else sample_state.shape[0] != self.state_size:
+                            print(f"--- [CẢNH BÁO] Ký ức cũ không khớp kích thước mới. Sẽ bắt đầu ký ức mới! ---")
+                            return
+                    self.memory = loaded_memory
                 print(f"--- Đã khôi phục {len(self.memory)} ký ức ---")
             except Exception as e:
                 print(f"Lỗi tải ký ức: {e}")
