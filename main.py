@@ -16,12 +16,9 @@ DATA_FILE_PATH = "btc_usdt_1m_data.csv"
 def fetch_data():
     try:
         if not os.path.exists(DATA_FILE_PATH):
-            print(f"Lỗi: Không tìm thấy file {DATA_FILE_PATH}")
             return None
         df = pd.read_csv(DATA_FILE_PATH)
-        # Sửa từ 500 lên 2000 để đọc hết dữ liệu bạn vừa tải
         df_short = df.head(2000).copy() 
-        print(f"--- Đã đọc {len(df_short)} nến dữ liệu để huấn luyện ---")
         return df_short
     except Exception as e:
         print(f"Lỗi đọc dữ liệu: {e}")
@@ -30,7 +27,7 @@ def fetch_data():
 def train_bot(episodes):
     firebase_initialized = initialize_firebase()
     initialize_telegram_bot()
-    send_telegram_message("🚀 Khởi động Bot (Dữ liệu: 2000 nến, Mục tiêu: 600$, Cháy: 450$)")
+    send_telegram_message("🚀 Khởi động Bot (100% Khám phá - Mục tiêu: 600$, Cháy: 450$)")
 
     data = fetch_data()
     if data is None: return
@@ -41,8 +38,9 @@ def train_bot(episodes):
     if firebase_initialized:
         if download_model_from_firebase(FIREBASE_MODEL_NAME, MODEL_SAVE_PATH):
              agent.load(MODEL_SAVE_PATH)
-             agent.epsilon = agent.epsilon_min 
-             print("--- Đã tải trí nhớ cũ từ Firebase ---")
+             # Đặt Epsilon = 1.0 để bot tò mò tối đa ngay từ đầu
+             agent.epsilon = 1.0 
+             print("--- Đã tải trí nhớ và đặt Epsilon = 1.0 (Khám phá tối đa) ---")
 
     for e in range(episodes):
         state = env.reset()
@@ -54,7 +52,7 @@ def train_bot(episodes):
         
         while not done:
             action = agent.choose_action(state)
-            leverage = 5 # Đòn bẩy cố định x5 cho ổn định
+            leverage = 5 
             next_state, reward, done = env.step(action, leverage)
             
             if next_state is not None:
@@ -65,9 +63,6 @@ def train_bot(episodes):
             total_profit += reward
             step_counter += 1
 
-            if step_counter % 200 == 0:
-                print(f"Tập {e+1}: Bước {step_counter}, Số dư: ${env.balance:.2f}")
-
         # --- Hết 1 Tập ---
         agent.replay() 
         
@@ -75,7 +70,8 @@ def train_bot(episodes):
         if env.balance >= 600: status = "THẮNG (600$)"
         elif env.balance <= 450: status = "CHÁY (450$)"
         
-        print(f"Tập {e+1} kết thúc. Trạng thái: {status}, Số dư: ${env.balance:.2f}")
+        if (e + 1) % 10 == 0:
+            print(f"Tập {e+1}: Số dư ${env.balance:.2f}, Epsilon: {agent.epsilon:.4f}, {status}")
 
         if (e + 1) % 5 == 0:
             agent.update_target_model()

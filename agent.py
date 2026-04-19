@@ -17,6 +17,7 @@ class Agent:
         self.gamma = DISCOUNT_FACTOR
         self.epsilon = EPSILON_START
         self.epsilon_min = EPSILON_END
+        # Tính toán mức giảm mỗi bước đi
         self.epsilon_decay = (EPSILON_START - EPSILON_END) / EPSILON_DECAY_STEPS
         self.learning_rate = LEARNING_RATE
         
@@ -29,6 +30,9 @@ class Agent:
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
+        # GIẢM EPSILON SAU MỖI BƯỚC LƯU BỘ NHỚ
+        if self.epsilon > self.epsilon_min:
+            self.epsilon -= self.epsilon_decay
 
     def choose_action(self, state):
         if np.random.rand() <= self.epsilon:
@@ -37,7 +41,6 @@ class Agent:
         return np.argmax(act_values[0])
 
     def replay(self, batch_size=BATCH_SIZE):
-        """Huấn luyện theo mẻ (Vectorized Replay) để tăng tốc độ."""
         if len(self.memory) < batch_size:
             return
             
@@ -64,9 +67,6 @@ class Agent:
                 targets[i][actions[i]] = rewards[i] + self.gamma * np.amax(target_next[i])
 
         self.model.fit(states, targets, epochs=1, verbose=0)
-            
-        if self.epsilon > self.epsilon_min:
-            self.epsilon -= self.epsilon_decay
 
     def load(self, name):
         if os.path.exists(name):
