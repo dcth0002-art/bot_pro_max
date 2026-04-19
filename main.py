@@ -3,8 +3,8 @@ import sys
 import os
 
 # Ẩn cảnh báo của TensorFlow
-os.environ[\'TF_CPP_MIN_LOG_LEVEL\'] = \'2\'
-os.environ[\'TF_ENABLE_ONEDNN_OPTS\'] = \'0\'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 # Thêm thư mục hiện tại vào PATH để Python tìm thấy các module
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -46,30 +46,30 @@ def fetch_data():
         df = pd.read_csv(DATA_FILE_PATH)
         return df.head(2000).copy()
     except Exception as e:
-        print(f"--- [LỖI] fetch_data: {e} ---\")
+        print(f"--- [LỖI] fetch_data: {e} ---")
         return None
 
-def train_bot(episodes):\
-    print("--- [KHỞI ĐỘNG] Kết nối Firebase & Telegram... ---\")
+def train_bot(episodes):
+    print("--- [KHỞI ĐỘNG] Kết nối Firebase & Telegram... ---")
     firebase_initialized = initialize_firebase()
     initialize_telegram_bot()
     
-    send_telegram_message("🤖 Bot đang khởi động...\")
+    send_telegram_message("🤖 Bot đang khởi động...")
 
     data = fetch_data()
     if data is None:
-        send_telegram_message("❌ Lỗi: Không có dữ liệu.\")
+        send_telegram_message("❌ Lỗi: Không có dữ liệu.")
         return
 
     agent = Agent(state_size=STATE_SIZE * 5)
     env = TradingEnvironment(data)
 
     if firebase_initialized:
-        if download_model_from_firebase(FIREBASE_MODEL_NAME, MODEL_SAVE_PATH):\
+        if download_model_from_firebase(FIREBASE_MODEL_NAME, MODEL_SAVE_PATH):
              agent.load(MODEL_SAVE_PATH)
              agent.epsilon = 1.0 
 
-    send_telegram_message("✅ Bot bắt đầu chạy!\")
+    send_telegram_message("✅ Bot bắt đầu chạy!")
 
     for e in range(episodes):
         try:
@@ -93,16 +93,16 @@ def train_bot(episodes):\
             if (e + 1) % 50 == 0:
                 agent.save(MODEL_SAVE_PATH)
                 status = "THẮNG" if env.balance >= 600 else ("CHÁY" if env.balance <= 450 else "HẾT")
-                summary = (f"📊 Tập {e+1}: {status}\\n- Số dư: ${env.balance:.2f}\\n- Epsilon: {agent.epsilon:.4f}")
+                summary = (f"📊 Tập {e+1}: {status}\n- Số dư: ${env.balance:.2f}\n- Epsilon: {agent.epsilon:.4f}")
                 send_telegram_message(summary)
                 if firebase_initialized:
                     upload_model_to_firebase(MODEL_SAVE_PATH, FIREBASE_MODEL_NAME)
                     
             if (e + 1) % 10 == 0:
-                print(f"Tiến độ: Tập {e+1} - Số dư: ${env.balance:.2f}\")
+                print(f"Tiến độ: Tập {e+1} - Số dư: ${env.balance:.2f}")
 
         except Exception as ex:
-            print(f"--- [LỖI] {ex} ---\")
+            print(f"--- [LỖI] {ex} ---")
             time.sleep(5)
 
 if __name__ == "__main__":
