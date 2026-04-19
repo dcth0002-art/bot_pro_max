@@ -2,6 +2,10 @@
 import sys
 import os
 
+# Ẩn cảnh báo của TensorFlow
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 # Thêm thư mục hiện tại vào PATH để Python tìm thấy các module
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -20,8 +24,7 @@ try:
     from firebase_storage import initialize_firebase, upload_model_to_firebase, download_model_from_firebase
     from telegram_reporter import initialize_telegram_bot, send_telegram_message
     
-    # Import theo cách an toàn
-    from . import download_data
+    import download_data
     
     print("--- [HỆ THỐNG] Nạp thư viện THÀNH CÔNG ---")
 except Exception as e:
