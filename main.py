@@ -34,7 +34,8 @@ except Exception as e:
     print(f"--- [LỖI] Không thể nạp thư viện: {e} ---")
     sys.exit(1)
 
-FIREBASE_MODEL_NAME = "trading_bot_model.h5" 
+# Cập nhật tên file cho Keras 3 (.weights.h5)
+FIREBASE_MODEL_NAME = "trading_bot_model.weights.h5" 
 DATA_FILE_PATH = "btc_usdt_1m_data.csv"
 
 def fetch_data():
@@ -124,4 +125,4 @@ def train_bot(episodes):
             time.sleep(1)
 
 if __name__ == "__main__":
-    train_bot(5000) # Tăng lên 5000 tập để bot có thời gian học lâu hơn
+    train_bot(5000)
