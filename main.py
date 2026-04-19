@@ -3,7 +3,7 @@ import sys
 import os
 import time
 
-# Ép Python in log ngay lập tức lên Railway
+# Ép Python in log ngay lập tức
 sys.stdout.reconfigure(line_buffering=True)
 
 # Ẩn cảnh báo của TensorFlow
@@ -60,25 +60,28 @@ def train_bot(episodes):
     firebase_initialized = initialize_firebase()
     initialize_telegram_bot()
     
-    send_telegram_message("🤖 Bot đang khởi động và nạp dữ liệu...")
+    send_telegram_message("🤖 Bot đang khởi động và nạp dữ liệu (Mục tiêu: $600)...")
 
     data = fetch_data()
     if data is None:
         send_telegram_message("❌ Lỗi: Không thể lấy dữ liệu để chạy.")
-        print("--- [DỪNG] Kết thúc do thiếu dữ liệu ---")
         return
 
     print("--- [HỆ THỐNG] Khởi tạo Agent và Môi trường... ---")
     agent = Agent(state_size=STATE_SIZE * 5)
     env = TradingEnvironment(data)
 
+    # Đảm bảo Epsilon bắt đầu từ 1.0 để học thử nghiệm hoàn toàn
+    agent.epsilon = 1.0
+
     if firebase_initialized:
-        print("--- [FIREBASE] Đang kiểm tra model cũ... ---")
+        print("--- [FIREBASE] Kiểm tra model cũ để tiếp tục học... ---")
         if download_model_from_firebase(FIREBASE_MODEL_NAME, MODEL_SAVE_PATH):
              agent.load(MODEL_SAVE_PATH)
-             agent.epsilon = 0.5 # Bắt đầu khám phá từ 50% nếu đã có model cũ
+             # Vẫn bắt đầu với epsilon 1.0 dù đã có model cũ để bot khám phá lại
+             agent.epsilon = 1.0 
 
-    send_telegram_message("✅ Bot bắt đầu phiên giao dịch huấn luyện!")
+    send_telegram_message("✅ Bot bắt đầu phiên huấn luyện (Epsilon 1.0)!")
     print("--- [CHẠY] Bắt đầu vòng lặp huấn luyện ---")
 
     for e in range(episodes):
@@ -97,25 +100,28 @@ def train_bot(episodes):
                     agent.remember(state, action, reward, next_state, done)
                 state = next_state
 
+            # Học từ bộ nhớ mỗi tập (episode)
             agent.replay()
             
+            # Cập nhật Target Model sau mỗi 5 tập
             if (e + 1) % 5 == 0:
                 agent.update_target_model()
 
-            if (e + 1) % 20 == 0: # Giảm xuống 20 tập để báo cáo nhanh hơn
+            # Báo cáo nhanh sau mỗi 20 tập
+            if (e + 1) % 20 == 0:
                 agent.save(MODEL_SAVE_PATH)
-                status = "THẮNG" if env.balance >= 600 else ("CHÁY" if env.balance <= 450 else "HẾT")
+                status = "THẮNG 🏆" if env.balance >= 600 else ("CHÁY 🔥" if env.balance <= 450 else "HẾT ⌛")
                 summary = (f"📊 Tập {e+1}: {status}\n- Số dư: ${env.balance:.2f}\n- Epsilon: {agent.epsilon:.4f}")
                 send_telegram_message(summary)
                 if firebase_initialized:
                     upload_model_to_firebase(MODEL_SAVE_PATH, FIREBASE_MODEL_NAME)
                     
             if (e + 1) % 5 == 0:
-                print(f"Tiến độ: Tập {e+1}/{episodes} - Số dư: ${env.balance:.2f}")
+                print(f"Tiến độ: Tập {e+1}/{episodes} - Số dư: ${env.balance:.2f} - Eps: {agent.epsilon:.4f}")
 
         except Exception as ex:
             print(f"--- [LỖI TRONG VÒNG LẶP] {ex} ---")
-            time.sleep(2)
+            time.sleep(1)
 
 if __name__ == "__main__":
-    train_bot(2000)
+    train_bot(5000) # Tăng lên 5000 tập để bot có thời gian học lâu hơn
