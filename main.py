@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
+import time
+
+# Ép Python in log ngay lập tức lên Railway
+sys.stdout.reconfigure(line_buffering=True)
 
 # Ẩn cảnh báo của TensorFlow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-# Thêm thư mục hiện tại vào PATH để Python tìm thấy các module
+# Thêm thư mục hiện tại vào PATH
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
@@ -14,7 +18,6 @@ if current_dir not in sys.path:
 print("--- [HỆ THỐNG] Đang nạp thư viện... ---")
 import numpy as np
 import pandas as pd
-import time
 
 try:
     from environment import TradingEnvironment
@@ -37,13 +40,16 @@ DATA_FILE_PATH = "btc_usdt_1m_data.csv"
 def fetch_data():
     try:
         if not os.path.exists(DATA_FILE_PATH):
-            print("--- [DỮ LIỆU] Đang tải 2000 nến mới... ---")
+            print("--- [DỮ LIỆU] Không tìm thấy file, bắt đầu tải 2000 nến... ---")
+            send_telegram_message("📥 Đang tải dữ liệu thị trường mới...")
             download_data.download_historical_data()
             
         if not os.path.exists(DATA_FILE_PATH):
+            print("--- [LỖI] Vẫn không tìm thấy file dữ liệu sau khi tải! ---")
             return None
             
         df = pd.read_csv(DATA_FILE_PATH)
+        print(f"--- [DỮ LIỆU] Đã nạp {len(df)} dòng dữ liệu ---")
         return df.head(2000).copy()
     except Exception as e:
         print(f"--- [LỖI] fetch_data: {e} ---")
@@ -54,26 +60,32 @@ def train_bot(episodes):
     firebase_initialized = initialize_firebase()
     initialize_telegram_bot()
     
-    send_telegram_message("🤖 Bot đang khởi động...")
+    send_telegram_message("🤖 Bot đang khởi động và nạp dữ liệu...")
 
     data = fetch_data()
     if data is None:
-        send_telegram_message("❌ Lỗi: Không có dữ liệu.")
+        send_telegram_message("❌ Lỗi: Không thể lấy dữ liệu để chạy.")
+        print("--- [DỪNG] Kết thúc do thiếu dữ liệu ---")
         return
 
+    print("--- [HỆ THỐNG] Khởi tạo Agent và Môi trường... ---")
     agent = Agent(state_size=STATE_SIZE * 5)
     env = TradingEnvironment(data)
 
     if firebase_initialized:
+        print("--- [FIREBASE] Đang kiểm tra model cũ... ---")
         if download_model_from_firebase(FIREBASE_MODEL_NAME, MODEL_SAVE_PATH):
              agent.load(MODEL_SAVE_PATH)
-             agent.epsilon = 1.0 
+             agent.epsilon = 0.5 # Bắt đầu khám phá từ 50% nếu đã có model cũ
 
-    send_telegram_message("✅ Bot bắt đầu chạy!")
+    send_telegram_message("✅ Bot bắt đầu phiên giao dịch huấn luyện!")
+    print("--- [CHẠY] Bắt đầu vòng lặp huấn luyện ---")
 
     for e in range(episodes):
         try:
             state = env.reset()
+            if state is None: break
+            
             state = np.reshape(state, [1, env.state_size])
             done = False
             
@@ -90,7 +102,7 @@ def train_bot(episodes):
             if (e + 1) % 5 == 0:
                 agent.update_target_model()
 
-            if (e + 1) % 50 == 0:
+            if (e + 1) % 20 == 0: # Giảm xuống 20 tập để báo cáo nhanh hơn
                 agent.save(MODEL_SAVE_PATH)
                 status = "THẮNG" if env.balance >= 600 else ("CHÁY" if env.balance <= 450 else "HẾT")
                 summary = (f"📊 Tập {e+1}: {status}\n- Số dư: ${env.balance:.2f}\n- Epsilon: {agent.epsilon:.4f}")
@@ -98,12 +110,12 @@ def train_bot(episodes):
                 if firebase_initialized:
                     upload_model_to_firebase(MODEL_SAVE_PATH, FIREBASE_MODEL_NAME)
                     
-            if (e + 1) % 10 == 0:
-                print(f"Tiến độ: Tập {e+1} - Số dư: ${env.balance:.2f}")
+            if (e + 1) % 5 == 0:
+                print(f"Tiến độ: Tập {e+1}/{episodes} - Số dư: ${env.balance:.2f}")
 
         except Exception as ex:
-            print(f"--- [LỖI] {ex} ---")
-            time.sleep(5)
+            print(f"--- [LỖI TRONG VÒNG LẶP] {ex} ---")
+            time.sleep(2)
 
 if __name__ == "__main__":
-    train_bot(1000)
+    train_bot(2000)
