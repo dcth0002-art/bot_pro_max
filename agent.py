@@ -3,7 +3,6 @@ import numpy as np
 import random
 import os
 from collections import deque
-from tensorflow.keras.models import load_model
 from model import create_model
 from config import (STATE_SIZE, ACTION_SPACE, LEARNING_RATE, DISCOUNT_FACTOR,
                     EPSILON_START, EPSILON_END, EPSILON_DECAY_STEPS,
@@ -17,10 +16,10 @@ class Agent:
         self.gamma = DISCOUNT_FACTOR
         self.epsilon = EPSILON_START
         self.epsilon_min = EPSILON_END
-        # Tính toán mức giảm mỗi bước đi
         self.epsilon_decay = (EPSILON_START - EPSILON_END) / EPSILON_DECAY_STEPS
         self.learning_rate = LEARNING_RATE
         
+        # Khởi tạo model từ cấu trúc trong model.py
         self.model = create_model(state_size, action_space, self.learning_rate)
         self.target_model = create_model(state_size, action_space, self.learning_rate)
         self.update_target_model()
@@ -30,7 +29,6 @@ class Agent:
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
-        # GIẢM EPSILON SAU MỖI BƯỚC LƯU BỘ NHỚ
         if self.epsilon > self.epsilon_min:
             self.epsilon -= self.epsilon_decay
 
@@ -69,13 +67,15 @@ class Agent:
         self.model.fit(states, targets, epochs=1, verbose=0)
 
     def load(self, name):
+        """Chỉ tải trọng số để tránh lỗi version Keras."""
         if os.path.exists(name):
             try:
-                self.model = load_model(name)
+                self.model.load_weights(name)
                 self.update_target_model()
-                print(f"--- Đã tải model từ {name} ---")
+                print(f"--- Đã tải trọng số model từ {name} ---")
             except Exception as e:
-                print(f"Lỗi khi tải model: {e}")
+                print(f"Lỗi khi tải trọng số: {e}")
 
     def save(self, name):
-        self.model.save(name)
+        """Chỉ lưu trọng số cho an toàn."""
+        self.model.save_weights(name)
