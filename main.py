@@ -21,7 +21,7 @@ try:
     from telegram_reporter import initialize_telegram_bot, send_telegram_message
     
     # Import theo cách an toàn
-    import download_data
+    from . import download_data
     
     print("--- [HỆ THỐNG] Nạp thư viện THÀNH CÔNG ---")
 except Exception as e:
