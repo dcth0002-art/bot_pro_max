@@ -34,8 +34,12 @@ except Exception as e:
     print(f"--- [LỖI] Không thể nạp thư viện: {e} ---")
     sys.exit(1)
 
-# Cập nhật tên file cho Keras 3 (.weights.h5)
+# Cấu hình đường dẫn lưu trữ
+os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
+MEMORY_SAVE_PATH = MODEL_SAVE_PATH.replace('.weights.h5', '_memory.pkl')
+
 FIREBASE_MODEL_NAME = "trading_bot_model.weights.h5" 
+FIREBASE_MEMORY_NAME = "trading_bot_memory.pkl"
 DATA_FILE_PATH = "btc_usdt_1m_data.csv"
 
 def fetch_data():
@@ -46,11 +50,9 @@ def fetch_data():
             download_data.download_historical_data()
             
         if not os.path.exists(DATA_FILE_PATH):
-            print("--- [LỖI] Vẫn không tìm thấy file dữ liệu sau khi tải! ---")
             return None
             
         df = pd.read_csv(DATA_FILE_PATH)
-        print(f"--- [DỮ LIỆU] Đã nạp {len(df)} dòng dữ liệu ---")
         return df.head(2000).copy()
     except Exception as e:
         print(f"--- [LỖI] fetch_data: {e} ---")
@@ -61,29 +63,32 @@ def train_bot(episodes):
     firebase_initialized = initialize_firebase()
     initialize_telegram_bot()
     
-    send_telegram_message("🤖 Bot đang khởi động và nạp dữ liệu (Mục tiêu: $600)...")
+    send_telegram_message("🤖 Bot đang khởi động và khôi phục ký ức...")
 
     data = fetch_data()
     if data is None:
-        send_telegram_message("❌ Lỗi: Không thể lấy dữ liệu để chạy.")
+        send_telegram_message("❌ Lỗi: Không thể lấy dữ liệu.")
         return
 
-    print("--- [HỆ THỐNG] Khởi tạo Agent và Môi trường... ---")
     agent = Agent(state_size=STATE_SIZE * 5)
     env = TradingEnvironment(data)
 
-    # Đảm bảo Epsilon bắt đầu từ 1.0 để học thử nghiệm hoàn toàn
+    # Đảm bảo Epsilon bắt đầu từ 1.0 nếu là lần đầu tiên
     agent.epsilon = 1.0
 
     if firebase_initialized:
-        print("--- [FIREBASE] Kiểm tra model cũ để tiếp tục học... ---")
+        print("--- [FIREBASE] Đang khôi phục Model & Ký ức cũ... ---")
+        # Tải Trí Não (Model)
         if download_model_from_firebase(FIREBASE_MODEL_NAME, MODEL_SAVE_PATH):
              agent.load(MODEL_SAVE_PATH)
-             # Vẫn bắt đầu với epsilon 1.0 dù đã có model cũ để bot khám phá lại
-             agent.epsilon = 1.0 
+             # Sau khi tải model, chúng ta sẽ cho bot khám phá từ từ
+             agent.epsilon = 0.5 
 
-    send_telegram_message("✅ Bot bắt đầu phiên huấn luyện (Epsilon 1.0)!")
-    print("--- [CHẠY] Bắt đầu vòng lặp huấn luyện ---")
+        # Tải Ký Ức (Memory)
+        if download_model_from_firebase(FIREBASE_MEMORY_NAME, MEMORY_SAVE_PATH):
+             agent.load_memory(MEMORY_SAVE_PATH)
+
+    send_telegram_message(f"✅ Đã khôi phục {len(agent.memory)} ký ức. Bắt đầu phiên huấn luyện!")
 
     for e in range(episodes):
         try:
@@ -101,27 +106,32 @@ def train_bot(episodes):
                     agent.remember(state, action, reward, next_state, done)
                 state = next_state
 
-            # Học từ bộ nhớ mỗi tập (episode)
             agent.replay()
             
-            # Cập nhật Target Model sau mỗi 5 tập
             if (e + 1) % 5 == 0:
                 agent.update_target_model()
 
-            # Báo cáo nhanh sau mỗi 20 tập
+            # Báo cáo và đồng bộ mỗi 20 tập
             if (e + 1) % 20 == 0:
+                # 1. Lưu trọng số Model
                 agent.save(MODEL_SAVE_PATH)
+                # 2. Lưu Ký ức thực tế
+                agent.save_memory(MEMORY_SAVE_PATH)
+                
                 status = "THẮNG 🏆" if env.balance >= 600 else ("CHÁY 🔥" if env.balance <= 450 else "HẾT ⌛")
-                summary = (f"📊 Tập {e+1}: {status}\n- Số dư: ${env.balance:.2f}\n- Epsilon: {agent.epsilon:.4f}")
+                summary = (f"📊 Tập {e+1}: {status}\n- Số dư: ${env.balance:.2f}\n- Epsilon: {agent.epsilon:.4f}\n- Ký ức: {len(agent.memory)}")
                 send_telegram_message(summary)
+                
                 if firebase_initialized:
+                    # Đồng bộ cả 2 file lên Server Firebase
                     upload_model_to_firebase(MODEL_SAVE_PATH, FIREBASE_MODEL_NAME)
+                    upload_model_to_firebase(MEMORY_SAVE_PATH, FIREBASE_MEMORY_NAME)
                     
             if (e + 1) % 5 == 0:
-                print(f"Tiến độ: Tập {e+1}/{episodes} - Số dư: ${env.balance:.2f} - Eps: {agent.epsilon:.4f}")
+                print(f"Tiến độ: Tập {e+1}/{episodes} - Số dư: ${env.balance:.2f} - Memory: {len(agent.memory)}")
 
         except Exception as ex:
-            print(f"--- [LỖI TRONG VÒNG LẶP] {ex} ---")
+            print(f"--- [LỖI] {ex} ---")
             time.sleep(1)
 
 if __name__ == "__main__":

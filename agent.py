@@ -2,6 +2,7 @@
 import numpy as np
 import random
 import os
+import pickle
 from collections import deque
 from model import create_model
 from config import (STATE_SIZE, ACTION_SPACE, LEARNING_RATE, DISCOUNT_FACTOR,
@@ -19,7 +20,6 @@ class Agent:
         self.epsilon_decay = (EPSILON_START - EPSILON_END) / EPSILON_DECAY_STEPS
         self.learning_rate = LEARNING_RATE
         
-        # Khởi tạo model từ cấu trúc trong model.py
         self.model = create_model(state_size, action_space, self.learning_rate)
         self.target_model = create_model(state_size, action_space, self.learning_rate)
         self.update_target_model()
@@ -43,7 +43,6 @@ class Agent:
             return
             
         minibatch = random.sample(self.memory, batch_size)
-        
         states = np.zeros((batch_size, self.state_size))
         next_states = np.zeros((batch_size, self.state_size))
         actions, rewards, dones = [], [], []
@@ -67,7 +66,6 @@ class Agent:
         self.model.fit(states, targets, epochs=1, verbose=0)
 
     def load(self, name):
-        """Chỉ tải trọng số để tránh lỗi version Keras."""
         if os.path.exists(name):
             try:
                 self.model.load_weights(name)
@@ -77,5 +75,24 @@ class Agent:
                 print(f"Lỗi khi tải trọng số: {e}")
 
     def save(self, name):
-        """Chỉ lưu trọng số cho an toàn."""
         self.model.save_weights(name)
+
+    # --- MỚI: LƯU VÀ TẢI KÝ ỨC (MEMORY) ---
+    def save_memory(self, path):
+        """Lưu lại deque memory vào file pickle"""
+        try:
+            with open(path, 'wb') as f:
+                pickle.dump(self.memory, f)
+            print(f"--- Đã lưu {len(self.memory)} ký ức vào {path} ---")
+        except Exception as e:
+            print(f"Lỗi lưu ký ức: {e}")
+
+    def load_memory(self, path):
+        """Tải lại deque memory từ file pickle"""
+        if os.path.exists(path):
+            try:
+                with open(path, 'rb') as f:
+                    self.memory = pickle.load(f)
+                print(f"--- Đã khôi phục {len(self.memory)} ký ức ---")
+            except Exception as e:
+                print(f"Lỗi tải ký ức: {e}")
