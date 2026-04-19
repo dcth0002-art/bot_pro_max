@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
-from config import STARTING_BALANCE, STATE_SIZE
+from config import STARTING_BALANCE, STATE_SIZE, LEVERAGE
 
 class TradingEnvironment:
     def __init__(self, data):
@@ -13,7 +13,7 @@ class TradingEnvironment:
         self.position = None 
         self.entry_price = 0
         self.done = False
-        self.fee = 0.0002 # Phí giao dịch 0.02%
+        self.fee = 0.0002 
 
     def _get_state(self):
         if self.current_step >= len(self.data):
@@ -24,12 +24,10 @@ class TradingEnvironment:
         cols = ['open', 'high', 'low', 'close', 'volume']
         state_data = self.data.iloc[start:end][cols].copy()
         
-        # Chuẩn hóa giá dựa trên giá đóng cửa cuối cùng
         last_close = state_data['close'].values[-1]
         price_cols = ['open', 'high', 'low', 'close']
         state_data[price_cols] = state_data[price_cols] / last_close
         
-        # Chuẩn hóa Volume
         max_vol = state_data['volume'].max()
         if max_vol > 0:
             state_data['volume'] = state_data['volume'] / max_vol
@@ -44,7 +42,7 @@ class TradingEnvironment:
         self.done = False
         return self._get_state()
 
-    def step(self, action, leverage=1):
+    def step(self, action, leverage=LEVERAGE):
         if self.done:
             return None, 0, True
 
@@ -52,39 +50,37 @@ class TradingEnvironment:
         current_price = self.data['close'].iloc[self.current_step]
         prev_price = self.data['close'].iloc[self.current_step - 1]
 
-        # 1. Tính lợi nhuận thực tế (P&L) dựa trên giá thay đổi giữa 2 bước
+        # 1. Tính lợi nhuận thực tế (P&L)
+        pnl_pct = 0
         if self.position == 'long':
             pnl_pct = (current_price - prev_price) / prev_price
-            self.balance += self.balance * pnl_pct * leverage
-            reward = pnl_pct * 10 # Reward nhỏ theo biến động giá
         elif self.position == 'short':
             pnl_pct = (prev_price - current_price) / prev_price
-            self.balance += self.balance * pnl_pct * leverage
-            reward = pnl_pct * 10
+        
+        step_pnl = self.balance * pnl_pct * leverage
+        self.balance += step_pnl
+        reward = pnl_pct * 20 # Tăng hệ số reward PnL để bot nhạy cảm hơn với lãi/lỗ
 
-        # 2. Xử lý hành động giao dịch
+        # 2. Xử lý hành động (Giảm phạt vào lệnh để bot tự tin hơn)
         if action == 1 and self.position != 'long': # Mở Long
             self.balance -= self.balance * self.fee 
             self.position = 'long'
-            reward -= 0.1 # Phạt nhẹ để tránh trade quá nhiều (overtrading)
+            reward -= 0.02 # Giảm phạt xuống 0.02 thay vì 0.1
         elif action == 2 and self.position != 'short': # Mở Short
             self.balance -= self.balance * self.fee
             self.position = 'short'
-            reward -= 0.1
+            reward -= 0.02
         elif action == 0 and self.position is not None: # Đóng lệnh
             self.balance -= self.balance * self.fee
             self.position = None
-            reward -= 0.05
+            reward -= 0.01
 
-        # 3. KIỂM TRA KẾT THÚC VÀ THƯỞNG/PHẠT NẶNG
-        # THẮNG: Đạt 600$ (+20% vốn)
+        # 3. KIỂM TRA KẾT THÚC
         if self.balance >= 600:
-            reward += 100 # THƯỞNG LỚN
+            reward += 100 
             self.done = True
-        
-        # THUA: Cháy/Lỗ xuống 450$ (-10% vốn)
         elif self.balance <= 450:
-            reward -= 200 # PHẠT RẤT NẶNG
+            reward -= 150 # Phạt vừa đủ để bot sợ nhưng không bị "sốc"
             self.done = True
 
         self.current_step += 1

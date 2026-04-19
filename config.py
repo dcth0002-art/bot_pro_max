@@ -6,21 +6,21 @@ IS_DEMO_ACCOUNT = True
 
 # Cấu hình giao dịch
 STARTING_BALANCE = 500.0 
-TARGET_BALANCE = 1000.0 
+TARGET_BALANCE = 600.0 
 TIMEFRAME = '1m' 
+LEVERAGE = 3 # Giảm đòn bẩy xuống 3 để an toàn hơn
 
-# Cấu hình cho mô hình học tăng cường (Reinforcement Learning)
-STATE_SIZE = 10 
+# Cấu hình cho mô hình AI
+STATE_SIZE = 20 # Nhìn lại 20 nến thay vì 10 để thấy xu hướng rõ hơn
 ACTION_SPACE = 3 
-LEARNING_RATE = 0.0005 
+LEARNING_RATE = 0.0003 # Tốc độ học chậm lại một chút để chắc chắn hơn
 DISCOUNT_FACTOR = 0.99 
 EPSILON_START = 1.0 
-EPSILON_END = 0.01 
-EPSILON_DECAY_STEPS = 200000 
+EPSILON_END = 0.05 # Không nên để 0.01, giữ 5% ngẫu nhiên để bot luôn nhạy bén
+EPSILON_DECAY_STEPS = 300000 # Cho bot trải nghiệm nhiều hơn trước khi chốt bài học
 
 # Cấu hình cho Replay Buffer
 BUFFER_SIZE = 50000 
 BATCH_SIZE = 128 
 
-# Cấu hình lưu trữ - Cập nhật đuôi .weights.h5 cho Keras 3
 MODEL_SAVE_PATH = 'saved_models/trading_bot_model.weights.h5'
