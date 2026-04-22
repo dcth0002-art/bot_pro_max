@@ -1,8 +1,0 @@
-tensorflow-cpu
-pandas
-numpy
-ccxt
-matplotlib
-firebase-admin
-python-telegram-bot
-# Thêm các thư viện khác nếu cần
