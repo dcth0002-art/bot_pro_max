@@ -227,7 +227,8 @@ class TradingBot:
                 side,
                 self.amount_coin,
                 params={
-                    "tdMode": "cross"
+                    "tdMode": "cross",
+                    "posSide": "long" if side == "buy" else "short"
                 }
             )
 
@@ -266,7 +267,8 @@ class TradingBot:
                 self.amount_coin,
                 params={
                     "tdMode": "cross",
-                    "reduceOnly": True
+                    "reduceOnly": True,
+                    "posSide": "long" if self.current_position == "buy" else "short"
                 }
             )
             print(f"✅ Đã đóng lệnh thật: {symbol}")
