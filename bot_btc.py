@@ -10,13 +10,13 @@ load_dotenv()
 
 # --- CẤU HÌNH ---
 SYMBOLS = [
-    'BTCUSDT', 'JTOUSDT', 'ETHUSDT', 'DOGEUSDT',
-    'SOLUSDT', 'XRPUSDT', 'BCHUSDT', 'LTCUSDT',
-    'OKBUSDT', 'KAITOUSDT', 'PIUSDT'
+    'BTC-USDT-SWAP', 'JTO-USDT-SWAP', 'ETH-USDT-SWAP', 'DOGE-USDT-SWAP',
+    'SOL-USDT-SWAP', 'XRP-USDT-SWAP', 'BCH-USDT-SWAP', 'LTC-USDT-SWAP',
+    'OKB-USDT-SWAP', 'KAITO-USDT-SWAP', 'PI-USDT-SWAP'
 ]
 LEVERAGE = 5
 DEFAULT_TRADE_AMOUNT = 5
-INITIAL_BALANCE = 16      
+INITIAL_BALANCE = 100      
 CHECK_INTERVAL = 1
 WARMUP_PERIOD = 300 
 VOL_WINDOW_SIZE = 1800 
@@ -222,10 +222,11 @@ class TradingBot:
         )
 
         try:
-            order = exchange.create_market_order(
-                symbol,
-                side,
-                self.amount_coin,
+            order = exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=side,
+                amount=self.amount_coin,
                 params={
                     "tdMode": "cross",
                     "posSide": "long" if side == "buy" else "short"
