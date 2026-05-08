@@ -14,18 +14,18 @@ SYMBOLS = [
     'SOL-USDT-SWAP', 'XRP-USDT-SWAP', 'BCH-USDT-SWAP', 'LTC-USDT-SWAP',
     'OKB-USDT-SWAP', 'KAITO-USDT-SWAP', 'PI-USDT-SWAP'
 ]
-LEVERAGE = 5
-DEFAULT_TRADE_AMOUNT = 5
-INITIAL_BALANCE = 100      
-CHECK_INTERVAL = 1
-WARMUP_PERIOD = 300 
-VOL_WINDOW_SIZE = 1800 
-COOLDOWN_PERIOD = 300 
-VOL_DIFF_THRESHOLD = 0.50 
-CONFIRMATION_TIME = 60 
-PRICE_SURGE_THRESHOLD = 0.002 
-STATUS_REPORT_INTERVAL = 600 
-FEE_RATE = 0.0005 # 0.05% position size = 0.5$
+LEVERAGE = 10 # đòn bẩy
+DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
+INITIAL_BALANCE = 17.83 # tổng vốn
+CHECK_INTERVAL = 1 # quét giá
+WARMUP_PERIOD = 300 # tích dữ liệu giá
+VOL_WINDOW_SIZE = 1800 # thời gian tính volume
+COOLDOWN_PERIOD = 300 # thời gian khóa coi sau khi trây xong
+VOL_DIFF_THRESHOLD = 0.50 # chênh lệch %
+CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
+PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
+STATUS_REPORT_INTERVAL = 600 # thời gian gửi báo cáo
+FEE_RATE = 0.0005 # 0.05% phí
 
 # --- THÔNG TIN TELEGRAM ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -40,6 +40,7 @@ exchange = ccxt.okx({
         'defaultType': 'swap'
     }
 })
+exchange.load_markets()
 bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
 def send_telegram(message):
@@ -204,16 +205,18 @@ class TradingBot:
             symbol,
             params={"mgnMode": "cross"}
         )
-        self.active_symbol = symbol
-        self.current_position = side
-        self.entry_price = price
+
         self.current_trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
         entry_fee = (self.current_trade_amount * LEVERAGE) * FEE_RATE
-        self.balance -= entry_fee
-        self.amount_coin = round(
-            (self.current_trade_amount * LEVERAGE) / price,
-            3
+
+
+
+        amount = exchange.amount_to_precision(
+            symbol,
+            (self.current_trade_amount * LEVERAGE) / price
         )
+
+        self.amount_coin = float(amount)
 
         exchange.set_leverage(
             LEVERAGE,
@@ -222,6 +225,9 @@ class TradingBot:
         )
 
         try:
+            print(f"symbol={symbol}")
+            print(f"amount={self.amount_coin}")
+            print(f"price={price}")
             order = exchange.create_order(
                 symbol=symbol,
                 type='market',
@@ -232,11 +238,11 @@ class TradingBot:
                     "posSide": "long" if side == "buy" else "short"
                 }
             )
-
+            self.balance -= entry_fee
             print(f"✅ Đã mở lệnh thật: {symbol}")
-
             self.active_symbol = symbol
             self.current_position = side
+            self.entry_price = price
 
         except Exception as e:
             print(f"❌ Lỗi mở lệnh: {e}")
