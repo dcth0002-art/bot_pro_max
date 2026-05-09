@@ -4,6 +4,7 @@ import os
 import telebot
 from dotenv import load_dotenv
 from collections import deque
+import numpy as np
 
 # Load biến môi trường
 load_dotenv()
@@ -24,7 +25,7 @@ COOLDOWN_PERIOD = 300 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 0.50 # chênh lệch %
 CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
-STATUS_REPORT_INTERVAL = 600 # thời gian gửi báo cáo
+STATUS_REPORT_INTERVAL = 1200 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
 
 # --- THÔNG TIN TELEGRAM ---
@@ -72,7 +73,9 @@ class TradingBot:
                 'trigger_vol_diff': 0, 
                 'last_close_time': 0,
                 'total_buy_30p': 0.0,
-                'total_sell_30p': 0.0
+                'total_sell_30p': 0.0,
+                'last_open': 0,
+                'last_close': 0,
             }
         
         self.start_time = time.time()
@@ -106,11 +109,47 @@ class TradingBot:
 
             ticker = exchange.fetch_ticker(symbol)
             current_price = ticker['last']
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=1)
+            last_candle = ohlcv[-1]
+
+            c['last_open'] = last_candle[1]
+            c['last_close'] = last_candle[4]
             c['price_history'].append(current_price)
             return current_price
         except Exception as e:
             print(f"Lỗi cập nhật {symbol}: {e}")
             return None
+
+    def calculate_bollinger_bands(self, prices, period=20, std_dev=2):
+        if len(prices) < period:
+            return None, None, None
+
+        closes = np.array(list(prices)[-period:])
+
+        middle = np.mean(closes)
+        std = np.std(closes)
+
+        upper = middle + (std * std_dev)
+        lower = middle - (std * std_dev)
+
+        return upper, middle, lower
+
+    def is_valid_bb_zone(self, side, current_price, upper, middle, lower):
+
+        if upper is None or middle is None or lower is None:
+            return False
+
+        # SELL gần dải trên
+        if side == 'sell':
+            upper_zone = middle + (upper - middle) * 0.75
+            return current_price >= upper_zone
+
+        # BUY gần dải dưới
+        elif side == 'buy':
+            lower_zone = lower + (middle - lower) * 0.25
+            return current_price <= lower_zone
+
+        return False
 
     def run(self):
         send_telegram(f"🚀 *Bot Đảo Chiều (Pure TP/SL) đã khởi động!*\n- Đóng lệnh: Chỉ chốt lãi 2% ròng hoặc Cháy 100%\n- Không đóng theo xu hướng hay vận tốc.")
@@ -157,20 +196,69 @@ class TradingBot:
                             price_change = (current_price - c['trigger_price']) / c['trigger_price']
                             
                             if c['pending_side'] == 'sell_trigger':
-                                if current_price < c['trigger_price']:
+                                if current_price < c['trigger_price'] * 0.999:
                                     c['pending_side'] = None
+
                                 elif elapsed >= CONFIRMATION_TIME:
+                                    if elapsed >= CONFIRMATION_TIME * 3:
+                                        print(f"⌛ [{symbol}] SELL timeout")
+                                        c['pending_side'] = None
+                                        continue
                                     if price_change >= PRICE_SURGE_THRESHOLD and buy_diff > c['trigger_vol_diff']:
+                                        upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
+
+                                        is_green_candle = c['last_close'] > c['last_open'] * 1.003
+
+                                        valid_bb = self.is_valid_bb_zone(
+                                            'sell',
+                                            current_price,
+                                            upper,
+                                            middle,
+                                            lower
+                                        )
+
+                                        if not valid_bb:
+                                            print(f"⌛ [{symbol}] SELL chờ chạm BB trên...")
+                                            continue
+
+                                        if not is_green_candle:
+                                            print(f"❌ [{symbol}] SELL bỏ qua - nến chưa xanh")
+                                            c['pending_side'] = None
+                                            continue
                                         self.open_position(symbol, 'sell', current_price, buy_diff)
                                         break
                                     else:
                                         c['pending_side'] = None
                             
                             elif c['pending_side'] == 'buy_trigger':
-                                if current_price > c['trigger_price']:
+                                if current_price > c['trigger_price'] * 1.001:
                                     c['pending_side'] = None
                                 elif elapsed >= CONFIRMATION_TIME:
+                                    if elapsed >= CONFIRMATION_TIME * 3:
+                                        print(f"⌛ [{symbol}] BUY timeout")
+                                        c['pending_side'] = None
+                                        continue
                                     if abs(price_change) >= PRICE_SURGE_THRESHOLD and sell_diff > c['trigger_vol_diff']:
+                                        upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
+
+                                        is_red_candle = c['last_close'] < c['last_open'] * 0.997
+
+                                        valid_bb = self.is_valid_bb_zone(
+                                            'buy',
+                                            current_price,
+                                            upper,
+                                            middle,
+                                            lower
+                                        )
+
+                                        if not valid_bb:
+                                            print(f"⌛ [{symbol}] BUY chờ chạm BB dưới...")
+                                            continue
+
+                                        if not is_red_candle:
+                                            print(f"❌ [{symbol}] BUY bỏ qua - nến chưa đỏ")
+                                            c['pending_side'] = None
+                                            continue
                                         self.open_position(symbol, 'buy', current_price, sell_diff)
                                         break
                                     else:
