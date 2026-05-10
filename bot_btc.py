@@ -50,7 +50,7 @@ all_symbols = [
 
 SYMBOLS = []
 
-print("Đang lọc coin volume cao...")
+print("Đang lọc coin volume cao...", flush=True)
 
 for symbol in all_symbols:
     try:
@@ -61,12 +61,12 @@ for symbol in all_symbols:
 
         if volume > 5_000_000:
             SYMBOLS.append(symbol)
-            print(f"✅ {symbol}")
+            print(f"✅ {symbol} | Vol: {volume:,.0f}", flush=True)
 
     except Exception as e:
         print(f"Lỗi {symbol}: {e}")
 
-print(f"Tổng coin quét: {len(SYMBOLS)}")
+print(f"Tổng coin quét: {len(SYMBOLS)}", flush=True)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
