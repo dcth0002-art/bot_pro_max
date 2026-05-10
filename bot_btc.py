@@ -10,15 +10,11 @@ import numpy as np
 load_dotenv()
 
 # --- CẤU HÌNH ---
-SYMBOLS = [
-    'BTC-USDT-SWAP', 'JTO-USDT-SWAP', 'ETH-USDT-SWAP', 'DOGE-USDT-SWAP',
-    'SOL-USDT-SWAP', 'XRP-USDT-SWAP', 'BCH-USDT-SWAP', 'LTC-USDT-SWAP',
-    'OKB-USDT-SWAP', 'KAITO-USDT-SWAP', 'PI-USDT-SWAP'
-]
+
 LEVERAGE = 10 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
 INITIAL_BALANCE = 17.83 # tổng vốn
-CHECK_INTERVAL = 1 # quét giá
+CHECK_INTERVAL = 3 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1800 # thời gian tính volume
 COOLDOWN_PERIOD = 300 # thời gian khóa coi sau khi trây xong
@@ -41,7 +37,35 @@ exchange = ccxt.okx({
         'defaultType': 'swap'
     }
 })
-exchange.load_markets()
+
+# Tự động lấy coin Futures USDT volume cao
+markets = exchange.load_markets()
+
+all_symbols = [
+    symbol for symbol, market in markets.items()
+    if market.get('swap')
+    and market.get('quote') == 'USDT'
+    and market.get('active') == True
+]
+
+SYMBOLS = []
+
+print("Đang lọc coin volume cao...")
+
+for symbol in all_symbols:
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+
+        # Chỉ lấy coin volume lớn hơn 5 triệu USDT
+        if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000:
+            SYMBOLS.append(symbol)
+            print(f"✅ {symbol}")
+
+    except Exception as e:
+        print(f"Lỗi {symbol}: {e}")
+
+print(f"Tổng coin quét: {len(SYMBOLS)}")
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
 def send_telegram(message):
@@ -163,7 +187,7 @@ class TradingBot:
                 else:
                     for sym in SYMBOLS:
                         self.update_coin_data(sym)
-                        time.sleep(0.05)
+                        time.sleep(0.01)
                     continue
 
             # --- TRƯỜNG HỢP 1: ĐI SĂN TÍN HIỆU ---
@@ -263,7 +287,7 @@ class TradingBot:
                                         break
                                     else:
                                         c['pending_side'] = None
-                    time.sleep(0.05)
+                    time.sleep(0.01)
 
             # --- TRƯỜNG HỢP 2: ĐANG GIỮ LỆNH (CHỈ TP/SL) ---
             else:
