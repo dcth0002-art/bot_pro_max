@@ -14,7 +14,7 @@ load_dotenv()
 LEVERAGE = 10 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
 INITIAL_BALANCE = 17.83 # tổng vốn
-CHECK_INTERVAL = 3 # quét giá
+CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1800 # thời gian tính volume
 COOLDOWN_PERIOD = 300 # thời gian khóa coi sau khi trây xong
@@ -38,35 +38,17 @@ exchange = ccxt.okx({
     }
 })
 
-# Tự động lấy coin Futures USDT volume cao
-markets = exchange.load_markets()
-
-all_symbols = [
+# Lấy toàn bộ Futures USDT đang hoạt động
+SYMBOLS = [
     symbol for symbol, market in markets.items()
     if market.get('swap')
     and market.get('quote') == 'USDT'
     and market.get('active') == True
 ]
+print(f"Tổng coin futures quét: {len(SYMBOLS)}", flush=True)
+for s in SYMBOLS[:20]:
+    print(f"✅ {s}", flush=True)
 
-SYMBOLS = []
-
-print("Đang lọc coin volume cao...", flush=True)
-
-for symbol in all_symbols:
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-
-        # Chỉ lấy coin volume lớn hơn 5 triệu USDT
-        volume = ticker.get('quoteVolume') or 0
-
-        if volume > 5_000_000:
-            SYMBOLS.append(symbol)
-            print(f"✅ {symbol} | Vol: {volume:,.0f}", flush=True)
-
-    except Exception as e:
-        print(f"Lỗi {symbol}: {e}")
-
-print(f"Tổng coin quét: {len(SYMBOLS)}", flush=True)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
