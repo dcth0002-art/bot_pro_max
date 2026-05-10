@@ -37,7 +37,7 @@ exchange = ccxt.okx({
         'defaultType': 'swap'
     }
 })
-
+markets = exchange.load_markets()
 # Lấy toàn bộ Futures USDT đang hoạt động
 SYMBOLS = [
     symbol for symbol, market in markets.items()
