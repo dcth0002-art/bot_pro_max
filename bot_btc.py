@@ -13,7 +13,7 @@ load_dotenv()
 
 LEVERAGE = 10 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 17.83 # tổng vốn
+INITIAL_BALANCE = 24.20 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1800 # thời gian tính volume
@@ -115,15 +115,17 @@ class TradingBot:
             c['total_buy_30p'] = sum(t[2] for t in c['vol_trades'] if t[1] == 'buy')
             c['total_sell_30p'] = sum(t[2] for t in c['vol_trades'] if t[1] == 'sell')
 
-            ticker = exchange.fetch_ticker(symbol)
-            current_price = ticker['last']
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=1)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=60)
+            closes = [x[4] for x in ohlcv]
+            c['price_history'].clear()
+            c['price_history'].extend(closes)
+            current_price = closes[-1]
             last_candle = ohlcv[-1]
-
             c['last_open'] = last_candle[1]
             c['last_close'] = last_candle[4]
-            c['price_history'].append(current_price)
             return current_price
+
+
         except Exception as e:
             print(f"Lỗi cập nhật {symbol}: {e}")
             return None
@@ -160,14 +162,14 @@ class TradingBot:
         return False
 
     def run(self):
-        send_telegram(f"🚀 *Bot Đảo Chiều (Pure TP/SL) đã khởi động!*\n- Đóng lệnh: Chỉ chốt lãi 2% ròng hoặc Cháy 100%\n- Không đóng theo xu hướng hay vận tốc.")
+        send_telegram(f"🚀 *Bé nhà đã dậy*\n- đang nạp dữ liệu")
         
         while True:
             current_time = time.time()
             if not self.is_warmed_up:
                 if current_time - self.start_time >= WARMUP_PERIOD:
                     self.is_warmed_up = True
-                    send_telegram("✅ *Tích lũy xong!* Bắt đầu săn tìm cơ hội.")
+                    send_telegram("✅ *Nạp dữ liệu xong!* Bắt đầu săn tìm cơ hội.")
                 else:
                     for sym in SYMBOLS:
                         self.update_coin_data(sym)
@@ -181,7 +183,7 @@ class TradingBot:
                     if current_price is None: continue
                     
                     c = self.coins[symbol]
-                    price_3p_ago = c['price_history'][-180] if len(c['price_history']) >= 180 else c['price_history'][0]
+                    price_3p_ago = c['price_history'][-3] if len(c['price_history']) >= 3 else c['price_history'][0]
                     buy_diff = (c['total_buy_30p'] - c['total_sell_30p']) / c['total_sell_30p'] if c['total_sell_30p'] > 0 else 1.0
                     sell_diff = (c['total_sell_30p'] - c['total_buy_30p']) / c['total_buy_30p'] if c['total_buy_30p'] > 0 else 1.0
 
