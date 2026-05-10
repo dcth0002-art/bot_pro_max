@@ -57,7 +57,9 @@ for symbol in all_symbols:
         ticker = exchange.fetch_ticker(symbol)
 
         # Chỉ lấy coin volume lớn hơn 5 triệu USDT
-        if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000:
+        volume = ticker.get('quoteVolume') or 0
+
+        if volume > 5_000_000:
             SYMBOLS.append(symbol)
             print(f"✅ {symbol}")
 
