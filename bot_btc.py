@@ -12,8 +12,8 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 10 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 0.5 # vốn vào lệnh
-INITIAL_BALANCE = 24.43 # tổng vốn
+DEFAULT_TRADE_AMOUNT = 1 # vốn vào lệnh
+INITIAL_BALANCE = 24.42 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 3600 # thời gian tính volume
@@ -289,7 +289,7 @@ class TradingBot:
 
                     total_fee = self.entry_fee + exit_fee
 
-                    target_profit = (self.current_trade_amount * 0.02) + total_fee
+                    target_profit = ((self.current_trade_amount * LEVERAGE) * 0.01) + total_fee
                     
                     if raw_pnl >= target_profit:
                         self.close_position(current_price, "Chốt lời (TP) lãi ròng 2%")
