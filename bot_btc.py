@@ -13,12 +13,12 @@ load_dotenv()
 
 LEVERAGE = 10 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 24.20 # tổng vốn
+INITIAL_BALANCE = 24.17 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
-VOL_WINDOW_SIZE = 1800 # thời gian tính volume
-COOLDOWN_PERIOD = 300 # thời gian khóa coi sau khi trây xong
-VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
+VOL_WINDOW_SIZE = 3600 # thời gian tính volume
+COOLDOWN_PERIOD = 600 # thời gian khóa coi sau khi trây xong
+VOL_DIFF_THRESHOLD = 2.00 # chênh lệch %
 CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
 STATUS_REPORT_INTERVAL = 1200 # thời gian gửi báo cáo
@@ -115,7 +115,7 @@ class TradingBot:
             c['total_buy_30p'] = sum(t[2] for t in c['vol_trades'] if t[1] == 'buy')
             c['total_sell_30p'] = sum(t[2] for t in c['vol_trades'] if t[1] == 'sell')
 
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=60)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
             closes = [x[4] for x in ohlcv]
             c['price_history'].clear()
             c['price_history'].extend(closes)
