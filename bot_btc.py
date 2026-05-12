@@ -13,10 +13,10 @@ load_dotenv()
 
 LEVERAGE = 10 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 1 # vốn vào lệnh
-INITIAL_BALANCE = 24.42 # tổng vốn
+INITIAL_BALANCE = 24.64 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
-VOL_WINDOW_SIZE = 3600 # thời gian tính volume
+VOL_WINDOW_SIZE = 1800 # thời gian tính volume
 COOLDOWN_PERIOD = 600 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 2.00 # chênh lệch %
 CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
