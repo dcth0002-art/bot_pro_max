@@ -12,7 +12,7 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 10 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 2 # vốn vào lệnh
+DEFAULT_TRADE_AMOUNT = 0.5 # vốn vào lệnh
 INITIAL_BALANCE = 24.17 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
@@ -285,7 +285,11 @@ class TradingBot:
                     else:
                         raw_pnl = (self.entry_price - current_price) * self.amount_coin
                     
-                    target_profit = (self.current_trade_amount * 0.02) + 1.0 # 2$ lãi + 1$ phí
+                    exit_fee = (self.current_trade_amount * LEVERAGE) * FEE_RATE
+
+                    total_fee = self.entry_fee + exit_fee
+
+                    target_profit = (self.current_trade_amount * 0.02) + total_fee
                     
                     if raw_pnl >= target_profit:
                         self.close_position(current_price, "Chốt lời (TP) lãi ròng 2%")
@@ -306,6 +310,7 @@ class TradingBot:
 
         self.current_trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
         entry_fee = (self.current_trade_amount * LEVERAGE) * FEE_RATE
+        self.entry_fee = entry_fee
 
 
 
@@ -352,7 +357,7 @@ class TradingBot:
             f"{emoji} *VÀO LỆNH {side.upper()} ({symbol})*\n"
             f"💰 Giá: `{price:,.4f}`\n"
             f"📊 Vol chênh lệch: `+{vol_diff*100:.1f}%` 🔥\n"
-            f"💸 Phí mở lệnh: `$0.50` (Đã trừ)\n"
+            f"💸 Phí mở lệnh: `${entry_fee:.4f}`\n"
             f"💵 Ký quỹ: `${self.current_trade_amount:,.2f}`"
         )
         send_telegram(msg)
@@ -391,8 +396,10 @@ class TradingBot:
 
         exit_fee = (self.current_trade_amount * LEVERAGE) * FEE_RATE
 
-        # Trừ tổng phí vào + ra
-        real_net_profit = raw_pnl - 1.0
+        total_fee = self.entry_fee + exit_fee
+
+        # Trừ đúng tổng phí thật
+        real_net_profit = raw_pnl - total_fee
 
         self.balance += (raw_pnl - exit_fee)
 
@@ -404,7 +411,7 @@ class TradingBot:
             f"⚠️ *ĐÓNG LỆNH {symbol}*\n"
             f"📝 Lý do: {reason}\n"
             f"🏁 Lợi nhuận thô: `{raw_pnl:,.2f}$`\n"
-            f"💸 Tổng phí (vào+ra): `$1.00`\n"
+            f"💸 Tổng phí (vào+ra): `${total_fee:.4f}`\n"
             f"💰 Lãi ròng thực tế: `{real_net_profit:,.2f}$` ({status})\n"
             f"🏦 Số dư cuối: `${self.balance:,.2f}$`"
         )
