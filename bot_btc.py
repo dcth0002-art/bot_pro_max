@@ -13,7 +13,7 @@ load_dotenv()
 
 LEVERAGE = 10 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 1 # vốn vào lệnh
-INITIAL_BALANCE = 24.64 # tổng vốn
+INITIAL_BALANCE = 25.66 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1800 # thời gian tính volume
@@ -314,10 +314,11 @@ class TradingBot:
 
 
 
-        amount = exchange.amount_to_precision(
-            symbol,
-            (self.current_trade_amount * LEVERAGE) / price
-        )
+        market = exchange.market(symbol)
+        contract_size = float(market.get("contractSize") or 1)
+        position_value = self.current_trade_amount * LEVERAGE
+        amount = position_value / (price * contract_size)
+        amount = exchange.amount_to_precision(symbol, amount)
 
         self.amount_coin = float(amount)
 
