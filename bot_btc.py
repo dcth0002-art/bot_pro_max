@@ -13,10 +13,10 @@ load_dotenv()
 
 LEVERAGE = 10 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 1 # vốn vào lệnh
-INITIAL_BALANCE = 25.66 # tổng vốn
+INITIAL_BALANCE = 25.88 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
-VOL_WINDOW_SIZE = 1800 # thời gian tính volume
+VOL_WINDOW_SIZE = 1000 # thời gian tính volume
 COOLDOWN_PERIOD = 600 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
 CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
@@ -280,20 +280,23 @@ class TradingBot:
                 symbol = self.active_symbol
                 current_price = self.update_coin_data(symbol)
                 if current_price:
-                    if self.current_position == 'buy':
-                        raw_pnl = (current_price - self.entry_price) * self.amount_coin
+                    positions = exchange.fetch_positions([symbol])
+
+                    if positions:
+                        unrealized_pnl = float(positions[0]['unrealizedPnl'])
                     else:
-                        raw_pnl = (self.entry_price - current_price) * self.amount_coin
-                    
+                        unrealized_pnl = 0
+
                     exit_fee = (self.current_trade_amount * LEVERAGE) * FEE_RATE
 
                     total_fee = self.entry_fee + exit_fee
 
                     target_profit = ((self.current_trade_amount * LEVERAGE) * 0.01) + total_fee
-                    
-                    if raw_pnl >= target_profit:
-                        self.close_position(current_price, "Chốt lời (TP) lãi ròng 2%")
-                    elif raw_pnl <= -self.current_trade_amount:
+
+                    if unrealized_pnl >= target_profit:
+                        self.close_position(current_price, "Chốt lời (TP) 1%")
+
+                    elif unrealized_pnl <= -self.current_trade_amount:
                         self.close_position(current_price, "Cháy tài khoản (SL 100%)")
 
             if current_time - self.last_status_time >= STATUS_REPORT_INTERVAL:
