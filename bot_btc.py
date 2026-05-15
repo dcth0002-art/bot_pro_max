@@ -13,7 +13,7 @@ load_dotenv()
 
 LEVERAGE = 10 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 1 # vốn vào lệnh
-INITIAL_BALANCE = 25.88 # tổng vốn
+INITIAL_BALANCE = 26.60 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -84,6 +84,9 @@ class TradingBot:
                 'total_sell_30p': 0.0,
                 'last_open': 0,
                 'last_close': 0,
+
+                'waiting_bb': False,
+                'bb_wait_candle': 0,
             }
         
         self.start_time = time.time()
@@ -121,6 +124,7 @@ class TradingBot:
             c['price_history'].extend(closes)
             current_price = closes[-1]
             last_candle = ohlcv[-1]
+            c['last_candle_time'] = last_candle[0]
             c['last_open'] = last_candle[1]
             c['last_close'] = last_candle[4]
             return current_price
@@ -160,6 +164,58 @@ class TradingBot:
             return current_price <= lower_zone
 
         return False
+
+    def is_boll_expanding_smooth(self, prices, period=20, lookback=4):
+
+        prices = list(prices)
+
+        # cần đủ dữ liệu
+        if len(prices) < period + lookback + 5:
+            return False
+
+        def get_bb_width(data):
+            middle = np.mean(data)
+            std = np.std(data)
+
+            upper = middle + (std * 2)
+            lower = middle - (std * 2)
+
+            return upper - lower
+
+        # ===== BB hiện tại =====
+        current_width = get_bb_width(prices[-period:])
+
+        # ===== BB cũ =====
+        old_width = get_bb_width(
+            prices[-period-lookback:-lookback]
+        )
+
+        # ===== BB hiện tại phải lớn hơn 30% =====
+        if current_width < old_width * 1.3:
+            return False
+
+        # ===== Kiểm tra mở rộng từ từ =====
+        widths = []
+
+        for i in range(lookback):
+
+            sample = prices[
+                -period-i:
+                -i if i != 0 else None
+            ]
+
+            width = get_bb_width(sample)
+
+            widths.append(width)
+
+        # phải mở rộng dần
+        if not (
+            widths[0] > widths[1] >
+            widths[2] > widths[3]
+        ):
+            return False
+
+        return True
 
     def run(self):
         send_telegram(f"🚀 *Bé nhà đã dậy*\n- đang nạp dữ liệu")
@@ -208,11 +264,16 @@ class TradingBot:
                             if c['pending_side'] == 'sell_trigger':
                                 if current_price < c['trigger_price'] * 0.999:
                                     c['pending_side'] = None
+                                    c['waiting_bb'] = False
+                                    c['bb_wait_candle'] = 0
 
                                 elif elapsed >= CONFIRMATION_TIME:
                                     if elapsed >= CONFIRMATION_TIME * 3:
                                         print(f"⌛ [{symbol}] SELL timeout")
+
                                         c['pending_side'] = None
+                                        c['waiting_bb'] = False
+                                        c['bb_wait_candle'] = 0
                                         continue
                                     if price_change >= PRICE_SURGE_THRESHOLD and buy_diff > c['trigger_vol_diff']:
                                         upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
@@ -231,6 +292,44 @@ class TradingBot:
                                             print(f"⌛ [{symbol}] SELL chờ chạm BB trên...")
                                             continue
 
+                                        bb_expand = self.is_boll_expanding_smooth(
+                                            c['price_history']
+                                        )
+
+                                        # ===== BB chưa đạt =====
+                                        if not bb_expand:
+
+                                            # chưa vào trạng thái chờ
+                                            if not c['waiting_bb']:
+
+                                                c['waiting_bb'] = True
+
+                                                # lưu cây nến hiện tại
+                                                c['bb_wait_candle'] = c['last_candle_time']
+
+                                                print(f"⌛ [{symbol}] SELL chờ BB mở rộng thêm...")
+                                                continue
+
+                                            # đã sang nến mới mà BB vẫn fail
+                                            elif c['last_candle_time'] != c['bb_wait_candle']:
+
+                                                print(f"❌ [{symbol}] SELL hủy - nến đóng nhưng BB chưa đạt")
+
+                                                c['waiting_bb'] = False
+                                                c['pending_side'] = None
+
+                                                continue
+
+                                            # vẫn đang trong cùng 1 nến
+                                            else:
+
+                                                print(f"⌛ [{symbol}] SELL đang đợi nến đóng...")
+                                                continue
+
+                                        # ===== BB đạt =====
+                                        c['waiting_bb'] = False
+                                        c['bb_wait_candle'] = 0
+
                                         if not is_green_candle:
                                             print(f"❌ [{symbol}] SELL bỏ qua - nến chưa xanh")
                                             c['pending_side'] = None
@@ -243,10 +342,15 @@ class TradingBot:
                             elif c['pending_side'] == 'buy_trigger':
                                 if current_price > c['trigger_price'] * 1.001:
                                     c['pending_side'] = None
+                                    c['waiting_bb'] = False
+                                    c['bb_wait_candle'] = 0
                                 elif elapsed >= CONFIRMATION_TIME:
                                     if elapsed >= CONFIRMATION_TIME * 3:
                                         print(f"⌛ [{symbol}] BUY timeout")
+
                                         c['pending_side'] = None
+                                        c['waiting_bb'] = False
+                                        c['bb_wait_candle'] = 0
                                         continue
                                     if abs(price_change) >= PRICE_SURGE_THRESHOLD and sell_diff > c['trigger_vol_diff']:
                                         upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
@@ -264,6 +368,43 @@ class TradingBot:
                                         if not valid_bb:
                                             print(f"⌛ [{symbol}] BUY chờ chạm BB dưới...")
                                             continue
+
+                                        bb_expand = self.is_boll_expanding_smooth(
+                                            c['price_history']
+                                        )
+
+                                        # ===== BB chưa đạt =====
+                                        if not bb_expand:
+
+                                            # chưa vào trạng thái chờ
+                                            if not c['waiting_bb']:
+
+                                                c['waiting_bb'] = True
+
+                                                # lưu cây nến hiện tại
+                                                c['bb_wait_candle'] = c['last_candle_time']
+
+                                                print(f"⌛ [{symbol}] BUY chờ BB mở rộng thêm...")
+                                                continue
+
+                                            # đã sang nến mới mà BB vẫn fail
+                                            elif c['last_candle_time'] != c['bb_wait_candle']:
+
+                                                print(f"❌ [{symbol}] BUY hủy - nến đóng nhưng BB chưa đạt")
+
+                                                c['waiting_bb'] = False
+                                                c['pending_side'] = None
+
+                                                continue
+
+                                            # vẫn đang trong cùng 1 nến
+                                            else:
+
+                                                print(f"⌛ [{symbol}] BUY đang đợi nến đóng...")
+                                                continue
+
+                                        # ===== BB đạt =====
+                                        c['waiting_bb'] = False
 
                                         if not is_red_candle:
                                             print(f"❌ [{symbol}] BUY bỏ qua - nến chưa đỏ")
@@ -412,12 +553,10 @@ class TradingBot:
         status = "LÃI ✅" if real_net_profit > 0 else "LỖ ❌"
 
         msg = (
-            f"⚠️ *ĐÓNG LỆNH {symbol}*\n"
+            f"✅ *ĐÓNG LỆNH {symbol}*\n"
             f"📝 Lý do: {reason}\n"
-            f"🏁 Lợi nhuận thô: `{raw_pnl:,.2f}$`\n"
             f"💸 Tổng phí (vào+ra): `${total_fee:.4f}`\n"
-            f"💰 Lãi ròng thực tế: `{real_net_profit:,.2f}$` ({status})\n"
-            f"🏦 Số dư cuối: `${self.balance:,.2f}$`"
+            f"💰  ({status})\n"
         )
 
         send_telegram(msg)
