@@ -169,8 +169,8 @@ class TradingBot:
         self,
         prices,
         period=20,
-        lookback=4,
-        min_percent=30 #% chênh lệch để so sánh BB cũ với hiện tại
+        lookback=8,
+        min_percent=90 #% chênh lệch để so sánh BB cũ với hiện tại
     ):
 
         prices = list(prices)
