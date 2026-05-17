@@ -165,15 +165,22 @@ class TradingBot:
 
         return False
 
-    def is_boll_expanding_smooth(self, prices, period=20, lookback=4):
+    def is_boll_expanding_smooth(
+        self,
+        prices,
+        period=20,
+        lookback=4,
+        min_percent=30 #% chênh lệch để so sánh BB cũ với hiện tại
+    ):
 
         prices = list(prices)
 
         # cần đủ dữ liệu
-        if len(prices) < period + lookback + 5:
+        if len(prices) < (period * 2) + lookback + 5:
             return False
 
         def get_bb_width(data):
+
             middle = np.mean(data)
             std = np.std(data)
 
@@ -183,25 +190,50 @@ class TradingBot:
             return upper - lower
 
         # ===== BB hiện tại =====
-        current_width = get_bb_width(prices[-period:])
-
-        # ===== BB cũ =====
-        old_width = get_bb_width(
-            prices[-period-lookback:-lookback]
+        current_width = get_bb_width(
+            prices[-period:]
         )
 
-        # ===== BB hiện tại phải lớn hơn 30% =====
-        if current_width < old_width * 1.3:
-            return False
+        # ===== lấy BB lớn nhất trong 20 nến cũ =====
 
-        # ===== Kiểm tra mở rộng từ từ =====
-        widths = []
+        old_widths = []
 
-        for i in range(lookback):
+        # bắt đầu sau vùng lookback
+        start_offset = lookback + 1
+
+        for i in range(start_offset, start_offset + period):
 
             sample = prices[
-                -period-i:
-                -i if i != 0 else None
+                -period - i:
+                -i
+            ]
+
+            width = get_bb_width(sample)
+
+            old_widths.append(width)
+
+        max_old_width = max(old_widths)
+
+        # ===== tính % =====
+        bb_percent = (
+            max_old_width / current_width
+        ) * 100
+
+        # ===== điều kiện % =====
+        if bb_percent < min_percent:
+            return False
+
+        # ===== kiểm tra mở rộng liên tục =====
+
+        widths = []
+
+        for i in range(lookback + 1):
+
+            offset = i
+
+            sample = prices[
+                -period - offset:
+                -offset if offset != 0 else None
             ]
 
             width = get_bb_width(sample)
@@ -209,11 +241,10 @@ class TradingBot:
             widths.append(width)
 
         # phải mở rộng dần
-        if not (
-            widths[0] > widths[1] >
-            widths[2] > widths[3]
-        ):
-            return False
+        for i in range(len(widths) - 1):
+
+            if widths[i] <= widths[i + 1]:
+                return False
 
         return True
 
