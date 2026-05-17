@@ -170,7 +170,7 @@ class TradingBot:
         prices,
         period=20,
         lookback=4,
-        min_percent=90 #% chênh lệch để so sánh BB cũ với hiện tại
+        min_percent=190 #% chênh lệch để so sánh BB cũ với hiện tại
     ):
 
         prices = list(prices)
@@ -216,7 +216,7 @@ class TradingBot:
 
         # ===== tính % =====
         bb_percent = (
-            max_old_width / current_width
+            current_width / max_old_width
         ) * 100
 
         # ===== điều kiện % =====
