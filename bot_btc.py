@@ -169,7 +169,7 @@ class TradingBot:
         self,
         prices,
         period=20,
-        lookback=8,
+        lookback=4,
         min_percent=90 #% chênh lệch để so sánh BB cũ với hiện tại
     ):
 
