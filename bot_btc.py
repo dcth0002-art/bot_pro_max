@@ -11,7 +11,7 @@ load_dotenv()
 
 # --- CẤU HÌNH ---
 
-LEVERAGE = 10 # đòn bẩy
+LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 1 # vốn vào lệnh
 INITIAL_BALANCE = 26.60 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
@@ -170,7 +170,7 @@ class TradingBot:
         prices,
         period=20,
         lookback=4,
-        min_percent=160 #% chênh lệch để so sánh BB cũ với hiện tại
+        min_percent=190 #% chênh lệch để so sánh BB cũ với hiện tại
     ):
 
         prices = list(prices)
