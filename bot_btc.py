@@ -23,6 +23,7 @@ CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
 STATUS_REPORT_INTERVAL = 1200 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
+MAX_POSITIONS = 5 # số lệnh tối đa cùng lúc
 
 # --- THÔNG TIN TELEGRAM ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -63,11 +64,7 @@ def send_telegram(message):
 class TradingBot:
     def __init__(self):
         self.balance = INITIAL_BALANCE
-        self.current_position = None
-        self.active_symbol = None
-        self.entry_price = 0
-        self.amount_coin = 0
-        self.current_trade_amount = 0
+        self.positions = []
         
         self.coins = {}
         for symbol in SYMBOLS:
@@ -264,7 +261,7 @@ class TradingBot:
                     continue
 
             # --- TRƯỜNG HỢP 1: ĐI SĂN TÍN HIỆU ---
-            if self.active_symbol is None:
+            if len(self.positions) < MAX_POSITIONS:
                 for symbol in SYMBOLS:
                     current_price = self.update_coin_data(symbol)
                     if current_price is None: continue
@@ -447,11 +444,15 @@ class TradingBot:
                                         c['pending_side'] = None
                     time.sleep(0.01)
 
-            # --- TRƯỜNG HỢP 2: ĐANG GIỮ LỆNH (CHỈ TP/SL) ---
-            else:
-                symbol = self.active_symbol
+            # --- QUẢN LÝ NHIỀU LỆNH ---
+            for pos in self.positions[:]:
+
+                symbol = pos['symbol']
+
                 current_price = self.update_coin_data(symbol)
+
                 if current_price:
+
                     positions = exchange.fetch_positions([symbol])
 
                     if positions:
@@ -459,17 +460,24 @@ class TradingBot:
                     else:
                         unrealized_pnl = 0
 
-                    exit_fee = (self.current_trade_amount * LEVERAGE) * FEE_RATE
+                    exit_fee = (pos['trade_amount'] * LEVERAGE) * FEE_RATE
 
-                    total_fee = self.entry_fee + exit_fee
+                    total_fee = pos['entry_fee'] + exit_fee
 
-                    target_profit = ((self.current_trade_amount * LEVERAGE) * 0.01) + total_fee
+                    target_profit = (
+                        (pos['trade_amount'] * LEVERAGE) * 0.01
+                    ) + total_fee
 
                     if unrealized_pnl >= target_profit:
-                        self.close_position(current_price, "Chốt lời (TP) 1%")
 
-                    elif unrealized_pnl <= -self.current_trade_amount:
-                        self.close_position(current_price, "Cháy tài khoản (SL 100%)")
+                        self.close_position(
+                            pos,
+                            current_price,
+                            "Chốt lời (TP) 1%"
+                        )
+
+                    #elif unrealized_pnl <= -self.current_trade_amount:
+                        #self.close_position(current_price, "Cháy tài khoản (SL 100%)")
 
             if current_time - self.last_status_time >= STATUS_REPORT_INTERVAL:
                 self.send_multi_report()
@@ -483,19 +491,18 @@ class TradingBot:
             params={"mgnMode": "cross"}
         )
 
-        self.current_trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
-        entry_fee = (self.current_trade_amount * LEVERAGE) * FEE_RATE
-        self.entry_fee = entry_fee
+        trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
+        entry_fee = (trade_amount * LEVERAGE) * FEE_RATE
 
 
 
         market = exchange.market(symbol)
         contract_size = float(market.get("contractSize") or 1)
-        position_value = self.current_trade_amount * LEVERAGE
+        position_value = trade_amount * LEVERAGE
         amount = position_value / (price * contract_size)
         amount = exchange.amount_to_precision(symbol, amount)
 
-        self.amount_coin = float(amount)
+        amount_coin = float(amount)
 
         exchange.set_leverage(
             LEVERAGE,
@@ -505,13 +512,13 @@ class TradingBot:
 
         try:
             print(f"symbol={symbol}")
-            print(f"amount={self.amount_coin}")
+            print(f"amount={amount_coin}")
             print(f"price={price}")
             order = exchange.create_order(
                 symbol=symbol,
                 type='market',
                 side=side,
-                amount=self.amount_coin,
+                amount=amount_coin,
                 params={
                     "tdMode": "cross",
                     "posSide": "long" if side == "buy" else "short"
@@ -519,9 +526,14 @@ class TradingBot:
             )
             self.balance -= entry_fee
             print(f"✅ Đã mở lệnh thật: {symbol}")
-            self.active_symbol = symbol
-            self.current_position = side
-            self.entry_price = price
+            self.positions.append({
+                'symbol': symbol,
+                'side': side,
+                'entry_price': price,
+                'amount_coin': amount_coin,
+                'trade_amount': trade_amount,
+                'entry_fee': entry_fee
+            })
 
         except Exception as e:
             print(f"❌ Lỗi mở lệnh: {e}")
@@ -534,27 +546,27 @@ class TradingBot:
             f"💰 Giá: `{price:,.4f}`\n"
             f"📊 Vol chênh lệch: `+{vol_diff*100:.1f}%` 🔥\n"
             f"💸 Phí mở lệnh: `${entry_fee:.4f}`\n"
-            f"💵 Ký quỹ: `${self.current_trade_amount:,.2f}`"
+            f"💵 Ký quỹ: `${trade_amount:,.2f}`"
         )
         send_telegram(msg)
         for s in SYMBOLS: self.coins[s]['pending_side'] = None
 
-    def close_position(self, price, reason):
-        symbol = self.active_symbol
+    def close_position(self, pos, price, reason):
+        symbol = pos['symbol']
 
         # Xác định chiều đóng lệnh
-        close_side = 'sell' if self.current_position == 'buy' else 'buy'
+        close_side = 'sell' if pos['side'] == 'buy' else 'buy'
 
         # Đóng lệnh thật trên OKX
         try:
             exchange.create_market_order(
                 symbol,
                 close_side,
-                self.amount_coin,
+                pos['amount_coin'],
                 params={
                     "tdMode": "cross",
                     "reduceOnly": True,
-                    "posSide": "long" if self.current_position == "buy" else "short"
+                    "posSide": "long" if pos['side'] == "buy" else "short"
                 }
             )
             print(f"✅ Đã đóng lệnh thật: {symbol}")
@@ -565,14 +577,14 @@ class TradingBot:
             return
 
         # Tính PNL giả lập để báo cáo Telegram
-        if self.current_position == 'buy':
-            raw_pnl = (price - self.entry_price) * self.amount_coin
+        if pos['side'] == 'buy':
+            raw_pnl = (price - pos['entry_price']) * pos['amount_coin']
         else:
-            raw_pnl = (self.entry_price - price) * self.amount_coin
+            raw_pnl = (pos['entry_price'] - price) * pos['amount_coin']
 
-        exit_fee = (self.current_trade_amount * LEVERAGE) * FEE_RATE
+        exit_fee = (pos['trade_amount'] * LEVERAGE) * FEE_RATE
 
-        total_fee = self.entry_fee + exit_fee
+        total_fee = pos['entry_fee'] + exit_fee
 
         # Trừ đúng tổng phí thật
         real_net_profit = raw_pnl - total_fee
@@ -593,11 +605,30 @@ class TradingBot:
         send_telegram(msg)
 
         # Reset position
-        self.active_symbol = None
-        self.current_position = None
+        self.positions.remove(pos)
 
     def send_multi_report(self):
-        msg = f"📊 *GIÁM SÁT HỆ THỐNG*\n📍 {'Đang trade: ' + self.active_symbol if self.active_symbol else 'Đang săn tín hiệu đảo chiều...'}\n🏦 Vốn: `${self.balance:,.2f}$`"
+
+        if self.positions:
+
+            symbols = [
+                pos['symbol']
+                for pos in self.positions
+            ]
+
+            status_text = ", ".join(symbols)
+
+        else:
+
+            status_text = "Đang săn tín hiệu đảo chiều..."
+
+        msg = (
+            f"📊 *GIÁM SÁT HỆ THỐNG*\n"
+            f"📍 {status_text}\n"
+            f"🏦 Vốn: `${self.balance:,.2f}$`\n"
+            f"📦 Số lệnh: `{len(self.positions)}/{MAX_POSITIONS}`"
+        )
+
         send_telegram(msg)
 
 if __name__ == "__main__":
