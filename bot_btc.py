@@ -145,11 +145,11 @@ class TradingBot:
 
         return upper, middle, lower
 
-        def has_open_position(self, symbol):
-            for pos in self.positions:
-                if pos['symbol'] == symbol:
+    def has_open_position(self, symbol):
+        for pos in self.positions:
+            if pos['symbol'] == symbol:
                     return True
-            return False
+        return False
 
     def is_valid_bb_zone(self, side, current_price, upper, middle, lower):
 
