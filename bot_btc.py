@@ -5,6 +5,7 @@ import telebot
 from dotenv import load_dotenv
 from collections import deque
 import numpy as np
+import traceback
 
 # Load biến môi trường
 load_dotenv()
@@ -12,8 +13,8 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 20 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 1 # vốn vào lệnh
-INITIAL_BALANCE = 26.21 # tổng vốn
+DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
+INITIAL_BALANCE = 66.36 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -276,7 +277,10 @@ class TradingBot:
                     # Coin đã có lệnh rồi thì bỏ qua
                     if self.has_open_position(symbol):
                         continue
-                    price_3p_ago = c['price_history'][-3] if len(c['price_history']) >= 3 else c['price_history'][0]
+                    if len(c['price_history']) < 3:
+                        continue
+
+                    price_3p_ago = c['price_history'][-3]
                     buy_diff = (c['total_buy_30p'] - c['total_sell_30p']) / c['total_sell_30p'] if c['total_sell_30p'] > 0 else 1.0
                     sell_diff = (c['total_sell_30p'] - c['total_buy_30p']) / c['total_buy_30p'] if c['total_buy_30p'] > 0 else 1.0
 
@@ -641,8 +645,23 @@ class TradingBot:
         send_telegram(msg)
 
 if __name__ == "__main__":
-    bot_trading = TradingBot()
-    try:
-        bot_trading.run()
-    except KeyboardInterrupt:
-        send_telegram("🛑 *Bot đã dừng.*")
+
+    while True:
+
+        try:
+
+            bot_trading = TradingBot()
+
+            bot_trading.run()
+
+        except Exception as e:
+
+            error_text = traceback.format_exc()
+
+            print(error_text)
+
+            send_telegram(
+                f"💥 Crash toàn bot:\n```{error_text[:3500]}```"
+            )
+
+            time.sleep(10)
