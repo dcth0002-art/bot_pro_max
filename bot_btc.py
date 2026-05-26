@@ -498,45 +498,45 @@ class TradingBot:
             time.sleep(CHECK_INTERVAL)
 
     def open_position(self, symbol, side, price, vol_diff):
-                # ===== TỰ ĐỘNG CHỌN ĐÒN BẨY =====
 
-                current_leverage = LEVERAGE
+        # ===== TỰ ĐỘNG CHỌN ĐÒN BẨY =====
+        current_leverage = LEVERAGE
 
-                try:
+        try:
 
-                    exchange.set_leverage(
-                        current_leverage,
-                        symbol,
-                        params={"mgnMode": "cross"}
-                    )
+            exchange.set_leverage(
+                current_leverage,
+                symbol,
+                params={"mgnMode": "cross"}
+            )
 
-                    print(f"✅ {symbol} dùng leverage x{current_leverage}")
+            print(f"✅ {symbol} dùng leverage x{current_leverage}")
 
-                except Exception:
+        except Exception:
 
-                    print(f"⚠️ {symbol} không hỗ trợ x{LEVERAGE}, thử x10...")
+            print(f"⚠️ {symbol} không hỗ trợ x{LEVERAGE}, thử x10...")
 
-                    try:
+            try:
 
-                        current_leverage = 10
+                current_leverage = 10
 
-                        exchange.set_leverage(
-                            current_leverage,
-                            symbol,
-                            params={"mgnMode": "cross"}
-                        )
+                exchange.set_leverage(
+                    current_leverage,
+                    symbol,
+                    params={"mgnMode": "cross"}
+                )
 
-                        print(f"✅ {symbol} chuyển sang leverage x10")
+                print(f"✅ {symbol} chuyển sang leverage x10")
 
-                    except Exception as e:
+            except Exception as e:
 
-                        print(f"❌ Không set được leverage cho {symbol}: {e}")
+                print(f"❌ Không set được leverage cho {symbol}: {e}")
 
-                        send_telegram(
-                            f"❌ {symbol} không hỗ trợ leverage phù hợp"
-                        )
+                send_telegram(
+                    f"❌ {symbol} không hỗ trợ leverage phù hợp"
+                )
 
-                        return
+                return
 
 
         trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
