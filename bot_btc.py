@@ -473,12 +473,12 @@ class TradingBot:
                     else:
                         unrealized_pnl = 0
 
-                    exit_fee = (pos['trade_amount'] * LEVERAGE) * FEE_RATE
+                    exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
 
                     total_fee = pos['entry_fee'] + exit_fee
 
                     target_profit = (
-                        (pos['trade_amount'] * LEVERAGE) * 0.01
+                        (pos['trade_amount'] * pos['leverage']) * 0.01
                     ) + total_fee
 
                     if unrealized_pnl >= target_profit:
@@ -498,30 +498,61 @@ class TradingBot:
             time.sleep(CHECK_INTERVAL)
 
     def open_position(self, symbol, side, price, vol_diff):
-        exchange.set_leverage(
-            LEVERAGE,
-            symbol,
-            params={"mgnMode": "cross"}
-        )
+                # ===== TỰ ĐỘNG CHỌN ĐÒN BẨY =====
+
+                current_leverage = LEVERAGE
+
+                try:
+
+                    exchange.set_leverage(
+                        current_leverage,
+                        symbol,
+                        params={"mgnMode": "cross"}
+                    )
+
+                    print(f"✅ {symbol} dùng leverage x{current_leverage}")
+
+                except Exception:
+
+                    print(f"⚠️ {symbol} không hỗ trợ x{LEVERAGE}, thử x10...")
+
+                    try:
+
+                        current_leverage = 10
+
+                        exchange.set_leverage(
+                            current_leverage,
+                            symbol,
+                            params={"mgnMode": "cross"}
+                        )
+
+                        print(f"✅ {symbol} chuyển sang leverage x10")
+
+                    except Exception as e:
+
+                        print(f"❌ Không set được leverage cho {symbol}: {e}")
+
+                        send_telegram(
+                            f"❌ {symbol} không hỗ trợ leverage phù hợp"
+                        )
+
+                        return
+
 
         trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
-        entry_fee = (trade_amount * LEVERAGE) * FEE_RATE
+        entry_fee = (trade_amount * current_leverage) * FEE_RATE
 
 
 
         market = exchange.market(symbol)
         contract_size = float(market.get("contractSize") or 1)
-        position_value = trade_amount * LEVERAGE
+        position_value = trade_amount * current_leverage
         amount = position_value / (price * contract_size)
         amount = exchange.amount_to_precision(symbol, amount)
 
         amount_coin = float(amount)
 
-        exchange.set_leverage(
-            LEVERAGE,
-            symbol,
-            params={"mgnMode": "cross"}
-        )
+
 
         try:
             print(f"symbol={symbol}")
@@ -545,7 +576,8 @@ class TradingBot:
                 'entry_price': price,
                 'amount_coin': amount_coin,
                 'trade_amount': trade_amount,
-                'entry_fee': entry_fee
+                'entry_fee': entry_fee,
+                'leverage': current_leverage
             })
 
         except Exception as e:
@@ -595,7 +627,7 @@ class TradingBot:
         else:
             raw_pnl = (pos['entry_price'] - price) * pos['amount_coin']
 
-        exit_fee = (pos['trade_amount'] * LEVERAGE) * FEE_RATE
+        exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
 
         total_fee = pos['entry_fee'] + exit_fee
 
