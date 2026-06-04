@@ -13,8 +13,8 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 20 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 66.36 # tổng vốn
+DEFAULT_TRADE_AMOUNT = 10 # vốn vào lệnh
+INITIAL_BALANCE = 100 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -473,6 +473,22 @@ class TradingBot:
                     else:
                         unrealized_pnl = 0
 
+                    # ===== Đóng lệnh quá 24h và âm trên 50% =====
+                    position_age = current_time - pos['open_time']
+
+                    loss_limit = pos['trade_amount'] * 0.5
+
+                    if (
+                        position_age >= 86400
+                        and unrealized_pnl <= -loss_limit
+                    ):
+                        self.close_position(
+                            pos,
+                            current_price,
+                            "Quá 24h và lỗ > 50%"
+                        )
+                        continue
+
                     exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
 
                     total_fee = pos['entry_fee'] + exit_fee
@@ -577,7 +593,8 @@ class TradingBot:
                 'amount_coin': amount_coin,
                 'trade_amount': trade_amount,
                 'entry_fee': entry_fee,
-                'leverage': current_leverage
+                'leverage': current_leverage,
+                'open_time': time.time()
             })
 
         except Exception as e:
