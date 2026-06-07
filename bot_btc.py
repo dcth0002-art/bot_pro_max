@@ -13,7 +13,7 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 20 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 10 # vốn vào lệnh
+DEFAULT_TRADE_AMOUNT = 2 # vốn vào lệnh
 INITIAL_BALANCE = 100 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
@@ -167,7 +167,7 @@ class TradingBot:
         # BUY phải chọc thủng dải dưới thêm 5% độ rộng BB
         elif side == 'buy':
             return current_price < lower - (bb_width * 0.05)
-    
+
         return False
 
     def is_strong_bb_break_candle(
@@ -181,7 +181,7 @@ class TradingBot:
         if len(ohlcv) < 2:
             return False
 
-        candle = ohlcv[-2]  # cây nến đã đóng
+        candle = ohlcv[-2]  # nến đã đóng
 
         o = candle[1]
         h = candle[2]
@@ -193,28 +193,28 @@ class TradingBot:
         if body <= 0:
             return False
 
-        body_percent = body / o
-
-        # SELL
+        # ===== SELL =====
         if side == "sell":
 
             upper_wick = h - max(o, c)
-
-            return (
-                c > upper
-                and upper_wick >= body * 0.3
-                and body_percent >= 0.005
-            )
-
-        # BUY
-        if side == "buy":
-
             lower_wick = min(o, c) - l
 
             return (
-                c < lower
-                and lower_wick >= body * 0.3
-                and body_percent >= 0.005
+                h > upper                    # có chọc BB trên
+                and upper_wick > body * 1.5  # râu trên dài
+                and upper_wick > lower_wick  # râu trên lớn hơn râu dưới
+            )
+
+        # ===== BUY =====
+        if side == "buy":
+
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+
+            return (
+                l < lower                    # có chọc BB dưới
+                and lower_wick > body * 1.5  # râu dưới dài
+                and lower_wick > upper_wick  # râu dưới lớn hơn râu trên
             )
 
         return False
@@ -429,7 +429,7 @@ class TradingBot:
                                     if price_change >= PRICE_SURGE_THRESHOLD and buy_diff > c['trigger_vol_diff']:
                                         upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
 
-                                        is_green_candle = c['last_close'] > c['last_open'] * 1.003
+                                        is_red_candle = c['last_close'] < c['last_open']
 
                                         valid_bb = self.is_valid_bb_zone(
                                             'sell',
@@ -484,8 +484,8 @@ class TradingBot:
                                         c['waiting_bb'] = False
                                         c['bb_wait_candle'] = 0
 
-                                        if not is_green_candle:
-                                            print(f"❌ [{symbol}] SELL bỏ qua - nến chưa xanh")
+                                        if not is_red_candle:
+                                            print(f"❌ [{symbol}] SELL bỏ qua - nến chưa đỏ")
                                             c['pending_side'] = None
                                             continue
                                         self.open_position(symbol, 'sell', current_price, buy_diff)
@@ -509,7 +509,7 @@ class TradingBot:
                                     if abs(price_change) >= PRICE_SURGE_THRESHOLD and sell_diff > c['trigger_vol_diff']:
                                         upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
 
-                                        is_red_candle = c['last_close'] < c['last_open'] * 0.997
+                                        is_green_candle = c['last_close'] > c['last_open']
 
                                         valid_bb = self.is_valid_bb_zone(
                                             'buy',
@@ -561,8 +561,8 @@ class TradingBot:
                                         # ===== BB đạt =====
                                         c['waiting_bb'] = False
 
-                                        if not is_red_candle:
-                                            print(f"❌ [{symbol}] BUY bỏ qua - nến chưa đỏ")
+                                        if not is_green_candle:
+                                            print(f"❌ [{symbol}] BUY bỏ qua - nến chưa xanh")
                                             c['pending_side'] = None
                                             continue
                                         self.open_position(symbol, 'buy', current_price, sell_diff)
