@@ -117,6 +117,7 @@ class TradingBot:
             c['total_sell_30p'] = sum(t[2] for t in c['vol_trades'] if t[1] == 'sell')
 
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
+            c['ohlcv'] = ohlcv
             closes = [x[4] for x in ohlcv]
             c['price_history'].clear()
             c['price_history'].extend(closes)
@@ -157,15 +158,64 @@ class TradingBot:
         if upper is None or middle is None or lower is None:
             return False
 
-        # SELL gần dải trên
-        if side == 'sell':
-            upper_zone = middle + (upper - middle) * 0.75
-            return current_price >= upper_zone
+        bb_width = upper - lower
 
-        # BUY gần dải dưới
+        # SELL phải chọc thủng dải trên thêm 5% độ rộng BB
+        if side == 'sell':
+            return current_price > upper + (bb_width * 0.05)
+
+        # BUY phải chọc thủng dải dưới thêm 5% độ rộng BB
         elif side == 'buy':
-            lower_zone = lower + (middle - lower) * 0.25
-            return current_price <= lower_zone
+            return current_price < lower - (bb_width * 0.05)
+    
+        return False
+
+    def is_strong_bb_break_candle(
+        self,
+        side,
+        ohlcv,
+        upper,
+        lower
+    ):
+
+        if len(ohlcv) < 2:
+            return False
+
+        candle = ohlcv[-2]  # cây nến đã đóng
+
+        o = candle[1]
+        h = candle[2]
+        l = candle[3]
+        c = candle[4]
+
+        body = abs(c - o)
+
+        if body <= 0:
+            return False
+
+        body_percent = body / o
+
+        # SELL
+        if side == "sell":
+
+            upper_wick = h - max(o, c)
+
+            return (
+                c > upper
+                and upper_wick >= body * 0.3
+                and body_percent >= 0.005
+            )
+
+        # BUY
+        if side == "buy":
+
+            lower_wick = min(o, c) - l
+
+            return (
+                c < lower
+                and lower_wick >= body * 0.3
+                and body_percent >= 0.005
+            )
 
         return False
 
@@ -280,6 +330,66 @@ class TradingBot:
                     if len(c['price_history']) < 3:
                         continue
 
+                    upper, middle, lower = self.calculate_bollinger_bands(
+                        c['price_history']
+                    )
+
+                    if upper is not None:
+
+                        # ===== SELL OVERRIDE =====
+                        if self.is_valid_bb_zone(
+                            'sell',
+                            current_price,
+                            upper,
+                            middle,
+                            lower
+                        ):
+
+                            if self.is_strong_bb_break_candle(
+                                'sell',
+                                c['ohlcv'],
+                                upper,
+                                lower
+                            ):
+
+                                print(f"🔥 [{symbol}] SELL BB OVERRIDE")
+
+                                self.open_position(
+                                    symbol,
+                                    'sell',
+                                    current_price,
+                                    0
+                                )
+
+                                break
+
+                        # ===== BUY OVERRIDE =====
+                        if self.is_valid_bb_zone(
+                            'buy',
+                            current_price,
+                            upper,
+                            middle,
+                            lower
+                        ):
+
+                            if self.is_strong_bb_break_candle(
+                                'buy',
+                                c['ohlcv'],
+                                upper,
+                                lower
+                            ):
+
+                                print(f"🔥 [{symbol}] BUY BB OVERRIDE")
+
+                                self.open_position(
+                                    symbol,
+                                    'buy',
+                                    current_price,
+                                    0
+                                )
+
+                                break
+
                     price_3p_ago = c['price_history'][-3]
                     buy_diff = (c['total_buy_30p'] - c['total_sell_30p']) / c['total_sell_30p'] if c['total_sell_30p'] > 0 else 1.0
                     sell_diff = (c['total_sell_30p'] - c['total_buy_30p']) / c['total_buy_30p'] if c['total_buy_30p'] > 0 else 1.0
@@ -329,9 +439,12 @@ class TradingBot:
                                             lower
                                         )
 
+
                                         if not valid_bb:
                                             print(f"⌛ [{symbol}] SELL chờ chạm BB trên...")
                                             continue
+
+
 
                                         bb_expand = self.is_boll_expanding_smooth(
                                             c['price_history']
@@ -405,6 +518,7 @@ class TradingBot:
                                             middle,
                                             lower
                                         )
+
 
                                         if not valid_bb:
                                             print(f"⌛ [{symbol}] BUY chờ chạm BB dưới...")
