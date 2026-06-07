@@ -13,8 +13,8 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 20 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 2 # vốn vào lệnh
-INITIAL_BALANCE = 100 # tổng vốn
+DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
+INITIAL_BALANCE = 66.36 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -25,6 +25,7 @@ PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
 STATUS_REPORT_INTERVAL = 1200 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
 MAX_POSITIONS = 5 # số lệnh tối đa cùng lúc
+MAX_DCA = 4
 
 # --- THÔNG TIN TELEGRAM ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -66,6 +67,9 @@ class TradingBot:
     def __init__(self):
         self.balance = INITIAL_BALANCE
         self.positions = []
+        self.current_max_positions = MAX_POSITIONS
+        self.active_dca_symbol = None
+        self.bot_paused = False
         
         self.coins = {}
         for symbol in SYMBOLS:
@@ -117,7 +121,6 @@ class TradingBot:
             c['total_sell_30p'] = sum(t[2] for t in c['vol_trades'] if t[1] == 'sell')
 
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
-            c['ohlcv'] = ohlcv
             closes = [x[4] for x in ohlcv]
             c['price_history'].clear()
             c['price_history'].extend(closes)
@@ -158,64 +161,15 @@ class TradingBot:
         if upper is None or middle is None or lower is None:
             return False
 
-        bb_width = upper - lower
-
-        # SELL phải chọc thủng dải trên thêm 5% độ rộng BB
+        # SELL gần dải trên
         if side == 'sell':
-            return current_price > upper + (bb_width * 0.05)
+            upper_zone = middle + (upper - middle) * 0.75
+            return current_price >= upper_zone
 
-        # BUY phải chọc thủng dải dưới thêm 5% độ rộng BB
+        # BUY gần dải dưới
         elif side == 'buy':
-            return current_price < lower - (bb_width * 0.05)
-
-        return False
-
-    def is_strong_bb_break_candle(
-        self,
-        side,
-        ohlcv,
-        upper,
-        lower
-    ):
-
-        if len(ohlcv) < 2:
-            return False
-
-        candle = ohlcv[-2]  # nến đã đóng
-
-        o = candle[1]
-        h = candle[2]
-        l = candle[3]
-        c = candle[4]
-
-        body = abs(c - o)
-
-        if body <= 0:
-            return False
-
-        # ===== SELL =====
-        if side == "sell":
-
-            upper_wick = h - max(o, c)
-            lower_wick = min(o, c) - l
-
-            return (
-                h > upper                    # có chọc BB trên
-                and upper_wick > body * 1.5  # râu trên dài
-                and upper_wick > lower_wick  # râu trên lớn hơn râu dưới
-            )
-
-        # ===== BUY =====
-        if side == "buy":
-
-            upper_wick = h - max(o, c)
-            lower_wick = min(o, c) - l
-
-            return (
-                l < lower                    # có chọc BB dưới
-                and lower_wick > body * 1.5  # râu dưới dài
-                and lower_wick > upper_wick  # râu dưới lớn hơn râu trên
-            )
+            lower_zone = lower + (middle - lower) * 0.25
+            return current_price <= lower_zone
 
         return False
 
@@ -306,6 +260,13 @@ class TradingBot:
         send_telegram(f"🚀 *Bé nhà đã dậy*\n- đang nạp dữ liệu")
         
         while True:
+
+            if self.bot_paused:
+
+                time.sleep(10)
+
+                continue
+
             current_time = time.time()
             if not self.is_warmed_up:
                 if current_time - self.start_time >= WARMUP_PERIOD:
@@ -318,7 +279,7 @@ class TradingBot:
                     continue
 
             # --- TRƯỜNG HỢP 1: ĐI SĂN TÍN HIỆU ---
-            if len(self.positions) < MAX_POSITIONS:
+            if len(self.positions) < self.current_max_positions:
                 for symbol in SYMBOLS:
                     current_price = self.update_coin_data(symbol)
                     if current_price is None: continue
@@ -329,66 +290,6 @@ class TradingBot:
                         continue
                     if len(c['price_history']) < 3:
                         continue
-
-                    upper, middle, lower = self.calculate_bollinger_bands(
-                        c['price_history']
-                    )
-
-                    if upper is not None:
-
-                        # ===== SELL OVERRIDE =====
-                        if self.is_valid_bb_zone(
-                            'sell',
-                            current_price,
-                            upper,
-                            middle,
-                            lower
-                        ):
-
-                            if self.is_strong_bb_break_candle(
-                                'sell',
-                                c['ohlcv'],
-                                upper,
-                                lower
-                            ):
-
-                                print(f"🔥 [{symbol}] SELL BB OVERRIDE")
-
-                                self.open_position(
-                                    symbol,
-                                    'sell',
-                                    current_price,
-                                    0
-                                )
-
-                                break
-
-                        # ===== BUY OVERRIDE =====
-                        if self.is_valid_bb_zone(
-                            'buy',
-                            current_price,
-                            upper,
-                            middle,
-                            lower
-                        ):
-
-                            if self.is_strong_bb_break_candle(
-                                'buy',
-                                c['ohlcv'],
-                                upper,
-                                lower
-                            ):
-
-                                print(f"🔥 [{symbol}] BUY BB OVERRIDE")
-
-                                self.open_position(
-                                    symbol,
-                                    'buy',
-                                    current_price,
-                                    0
-                                )
-
-                                break
 
                     price_3p_ago = c['price_history'][-3]
                     buy_diff = (c['total_buy_30p'] - c['total_sell_30p']) / c['total_sell_30p'] if c['total_sell_30p'] > 0 else 1.0
@@ -429,7 +330,7 @@ class TradingBot:
                                     if price_change >= PRICE_SURGE_THRESHOLD and buy_diff > c['trigger_vol_diff']:
                                         upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
 
-                                        is_red_candle = c['last_close'] < c['last_open']
+                                        is_green_candle = c['last_close'] > c['last_open'] * 1.003
 
                                         valid_bb = self.is_valid_bb_zone(
                                             'sell',
@@ -439,12 +340,9 @@ class TradingBot:
                                             lower
                                         )
 
-
                                         if not valid_bb:
                                             print(f"⌛ [{symbol}] SELL chờ chạm BB trên...")
                                             continue
-
-
 
                                         bb_expand = self.is_boll_expanding_smooth(
                                             c['price_history']
@@ -484,8 +382,8 @@ class TradingBot:
                                         c['waiting_bb'] = False
                                         c['bb_wait_candle'] = 0
 
-                                        if not is_red_candle:
-                                            print(f"❌ [{symbol}] SELL bỏ qua - nến chưa đỏ")
+                                        if not is_green_candle:
+                                            print(f"❌ [{symbol}] SELL bỏ qua - nến chưa xanh")
                                             c['pending_side'] = None
                                             continue
                                         self.open_position(symbol, 'sell', current_price, buy_diff)
@@ -509,7 +407,7 @@ class TradingBot:
                                     if abs(price_change) >= PRICE_SURGE_THRESHOLD and sell_diff > c['trigger_vol_diff']:
                                         upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
 
-                                        is_green_candle = c['last_close'] > c['last_open']
+                                        is_red_candle = c['last_close'] < c['last_open'] * 0.997
 
                                         valid_bb = self.is_valid_bb_zone(
                                             'buy',
@@ -518,7 +416,6 @@ class TradingBot:
                                             middle,
                                             lower
                                         )
-
 
                                         if not valid_bb:
                                             print(f"⌛ [{symbol}] BUY chờ chạm BB dưới...")
@@ -561,8 +458,8 @@ class TradingBot:
                                         # ===== BB đạt =====
                                         c['waiting_bb'] = False
 
-                                        if not is_green_candle:
-                                            print(f"❌ [{symbol}] BUY bỏ qua - nến chưa xanh")
+                                        if not is_red_candle:
+                                            print(f"❌ [{symbol}] BUY bỏ qua - nến chưa đỏ")
                                             c['pending_side'] = None
                                             continue
                                         self.open_position(symbol, 'buy', current_price, sell_diff)
@@ -587,29 +484,30 @@ class TradingBot:
                     else:
                         unrealized_pnl = 0
 
-                    # ===== Đóng lệnh quá 24h và âm trên 50% =====
-                    position_age = current_time - pos['open_time']
-
-                    loss_limit = pos['trade_amount'] * 0.5
-
                     if (
-                        position_age >= 86400
-                        and unrealized_pnl <= -loss_limit
+                        unrealized_pnl <= -pos['trade_amount']
+                        and not pos['waiting_dca']
+                        and pos['dca_count'] < MAX_DCA
                     ):
-                        self.close_position(
-                            pos,
-                            current_price,
-                            "Quá 24h và lỗ > 50%"
+                        pos['waiting_dca'] = True
+
+                        send_telegram(
+                            f"⚠️ {symbol} âm 100%, chờ DCA"
                         )
-                        continue
 
                     exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
 
                     total_fee = pos['entry_fee'] + exit_fee
 
-                    target_profit = (
-                        (pos['trade_amount'] * pos['leverage']) * 0.01
-                    ) + total_fee
+                    if pos['is_dca_position']:
+
+                        target_profit = total_fee
+
+                    else:
+
+                        target_profit = (
+                            (pos['trade_amount'] * pos['leverage']) * 0.01
+                        ) + total_fee
 
                     if unrealized_pnl >= target_profit:
 
@@ -621,6 +519,21 @@ class TradingBot:
 
                     #elif unrealized_pnl <= -self.current_trade_amount:
                         #self.close_position(current_price, "Cháy tài khoản (SL 100%)")
+
+            for pos in self.positions:
+
+                if not pos['waiting_dca']:
+                    continue
+
+                if self.active_dca_symbol:
+                    continue
+
+                if len(self.positions) >= self.current_max_positions:
+                    continue
+
+                self.execute_dca(pos)
+
+                break
 
             if current_time - self.last_status_time >= STATUS_REPORT_INTERVAL:
                 self.send_multi_report()
@@ -668,26 +581,42 @@ class TradingBot:
 
                 return
 
-
         trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
-        entry_fee = (trade_amount * current_leverage) * FEE_RATE
 
-
+        entry_fee = (
+            trade_amount *
+            current_leverage
+        ) * FEE_RATE
 
         market = exchange.market(symbol)
-        contract_size = float(market.get("contractSize") or 1)
-        position_value = trade_amount * current_leverage
-        amount = position_value / (price * contract_size)
-        amount = exchange.amount_to_precision(symbol, amount)
+
+        contract_size = float(
+            market.get("contractSize") or 1
+        )
+
+        position_value = (
+            trade_amount *
+            current_leverage
+        )
+
+        amount = (
+            position_value /
+            (price * contract_size)
+        )
+
+        amount = exchange.amount_to_precision(
+            symbol,
+            amount
+        )
 
         amount_coin = float(amount)
 
-
-
         try:
+
             print(f"symbol={symbol}")
             print(f"amount={amount_coin}")
             print(f"price={price}")
+
             order = exchange.create_order(
                 symbol=symbol,
                 type='market',
@@ -695,11 +624,16 @@ class TradingBot:
                 amount=amount_coin,
                 params={
                     "tdMode": "cross",
-                    "posSide": "long" if side == "buy" else "short"
+                    "posSide": "long"
+                    if side == "buy"
+                    else "short"
                 }
             )
+
             self.balance -= entry_fee
+
             print(f"✅ Đã mở lệnh thật: {symbol}")
+
             self.positions.append({
                 'symbol': symbol,
                 'side': side,
@@ -708,15 +642,24 @@ class TradingBot:
                 'trade_amount': trade_amount,
                 'entry_fee': entry_fee,
                 'leverage': current_leverage,
-                'open_time': time.time()
+
+                'dca_count': 0,
+                'waiting_dca': False,
+                'is_dca_position': False
             })
 
         except Exception as e:
+
             print(f"❌ Lỗi mở lệnh: {e}")
-            send_telegram(f"❌ Lỗi mở lệnh {symbol}:\n`{e}`")
+
+            send_telegram(
+                f"❌ Lỗi mở lệnh {symbol}:\n`{e}`"
+            )
+
             return
-        
-        emoji = "🔴" if side == 'sell' else "🟢"
+
+        emoji = "🔴" if side == "sell" else "🟢"
+
         msg = (
             f"{emoji} *VÀO LỆNH {side.upper()} ({symbol})*\n"
             f"💰 Giá: `{price:,.4f}`\n"
@@ -724,8 +667,118 @@ class TradingBot:
             f"💸 Phí mở lệnh: `${entry_fee:.4f}`\n"
             f"💵 Ký quỹ: `${trade_amount:,.2f}`"
         )
+
         send_telegram(msg)
-        for s in SYMBOLS: self.coins[s]['pending_side'] = None
+
+        for s in SYMBOLS:
+            self.coins[s]['pending_side'] = None
+
+
+
+
+    def execute_dca(self, pos):
+
+        symbol = pos['symbol']
+
+        trade_amount = DEFAULT_TRADE_AMOUNT
+
+        try:
+
+            ticker = exchange.fetch_ticker(symbol)
+
+            current_price = ticker['last']
+
+            market = exchange.market(symbol)
+
+            contract_size = float(
+                market.get("contractSize") or 1
+            )
+
+            position_value = (
+                trade_amount *
+                pos['leverage']
+            )
+
+            amount = (
+                position_value /
+                (current_price * contract_size)
+            )
+
+            amount = exchange.amount_to_precision(
+                symbol,
+                amount
+            )
+
+            exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=pos['side'],
+                amount=float(amount),
+                params={
+                    "tdMode": "cross",
+                    "posSide": "long"
+                    if pos['side'] == "buy"
+                    else "short"
+                }
+            )
+            time.sleep(2)
+            positions = exchange.fetch_positions([symbol])
+
+            if positions:
+
+                pos['entry_price'] = float(
+                    positions[0]['entryPrice']
+                )
+
+                pos['amount_coin'] = float(
+                    positions[0]['contracts']
+                )
+
+                print(
+                    f"✅ Giá trung bình mới: {pos['entry_price']}"
+                )
+
+                print(
+                    f"✅ Khối lượng mới: {pos['amount_coin']}"
+                )
+
+            pos['trade_amount'] += trade_amount
+
+            pos['entry_fee'] += (
+                trade_amount *
+                pos['leverage']
+            ) * FEE_RATE
+
+            pos['dca_count'] += 1
+
+            pos['waiting_dca'] = False
+
+            pos['is_dca_position'] = True
+
+            self.current_max_positions -= 1
+
+            self.active_dca_symbol = symbol
+
+            send_telegram(
+                f"📉 DCA lần {pos['dca_count']} cho {symbol}\n"
+                f"📦 Slot còn: {self.current_max_positions}"
+            )
+
+            if pos['dca_count'] >= MAX_DCA:
+
+                self.bot_paused = True
+
+                send_telegram(
+                    f"🚨 {symbol} đã DCA tối đa {MAX_DCA} lần\n"
+                    f"🚨 Bot tạm dừng để xử lý thủ công"
+                )
+
+        except Exception as e:
+
+            print(f"DCA lỗi: {e}")
+
+
+
 
     def close_position(self, pos, price, reason):
         symbol = pos['symbol']
@@ -753,10 +806,17 @@ class TradingBot:
             return
 
         # Tính PNL giả lập để báo cáo Telegram
-        if pos['side'] == 'buy':
-            raw_pnl = (price - pos['entry_price']) * pos['amount_coin']
+        positions = exchange.fetch_positions([symbol])
+
+        if positions:
+
+            raw_pnl = float(
+                positions[0]['unrealizedPnl']
+            )
+
         else:
-            raw_pnl = (pos['entry_price'] - price) * pos['amount_coin']
+
+            raw_pnl = 0
 
         exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
 
@@ -779,6 +839,13 @@ class TradingBot:
         )
 
         send_telegram(msg)
+        if pos['dca_count'] > 0:
+
+            self.current_max_positions = MAX_POSITIONS
+
+            self.active_dca_symbol = None
+
+            self.bot_paused = False
 
         # Reset position
         self.positions.remove(pos)
