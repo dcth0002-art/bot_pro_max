@@ -14,7 +14,7 @@ load_dotenv()
 
 LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 66.36 # tổng vốn
+INITIAL_BALANCE = 82.95 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -480,19 +480,42 @@ class TradingBot:
                     positions = exchange.fetch_positions([symbol])
 
                     if positions:
-                        unrealized_pnl = float(positions[0]['unrealizedPnl'])
+                        unrealized_pnl = float(
+                            positions[0].get('unrealizedPnl') or 0
+                        )
                     else:
                         unrealized_pnl = 0
 
+                    first_price = pos['first_entry_price']
+
+                    if pos['side'] == 'buy':
+
+                        loss_percent = (
+                            (first_price - current_price)
+                            / first_price
+                        ) * 100
+
+                    else:
+
+                        loss_percent = (
+                            (current_price - first_price)
+                            / first_price
+                        ) * 100
+
+                    next_dca_level = (
+                        pos['dca_count'] + 1
+                    ) * (100 / pos['leverage'])
+
                     if (
-                        unrealized_pnl <= -pos['trade_amount']
+                        loss_percent >= next_dca_level
                         and not pos['waiting_dca']
                         and pos['dca_count'] < MAX_DCA
                     ):
+
                         pos['waiting_dca'] = True
 
                         send_telegram(
-                            f"⚠️ {symbol} âm 100%, chờ DCA"
+                            f"⚠️ {symbol} đạt ngưỡng DCA {pos['dca_count']+1}, chờ DCA"
                         )
 
                     exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
@@ -637,7 +660,10 @@ class TradingBot:
             self.positions.append({
                 'symbol': symbol,
                 'side': side,
+
                 'entry_price': price,
+                'first_entry_price': price,
+
                 'amount_coin': amount_coin,
                 'trade_amount': trade_amount,
                 'entry_fee': entry_fee,
@@ -786,6 +812,19 @@ class TradingBot:
         # Xác định chiều đóng lệnh
         close_side = 'sell' if pos['side'] == 'buy' else 'buy'
 
+        # Lấy PNL trước khi đóng lệnh
+        positions = exchange.fetch_positions([symbol])
+
+        if positions:
+
+            raw_pnl = float(
+                positions[0].get('unrealizedPnl') or 0
+            )
+
+        else:
+
+            raw_pnl = 0
+
         # Đóng lệnh thật trên OKX
         try:
             exchange.create_market_order(
@@ -798,25 +837,18 @@ class TradingBot:
                     "posSide": "long" if pos['side'] == "buy" else "short"
                 }
             )
+
             print(f"✅ Đã đóng lệnh thật: {symbol}")
 
         except Exception as e:
+
             print(f"❌ Lỗi đóng lệnh thật: {e}")
-            send_telegram(f"❌ Lỗi đóng lệnh thật {symbol}:\n`{e}`")
-            return
 
-        # Tính PNL giả lập để báo cáo Telegram
-        positions = exchange.fetch_positions([symbol])
-
-        if positions:
-
-            raw_pnl = float(
-                positions[0]['unrealizedPnl']
+            send_telegram(
+                f"❌ Lỗi đóng lệnh thật {symbol}:\n`{e}`"
             )
 
-        else:
-
-            raw_pnl = 0
+            return
 
         exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
 
