@@ -14,7 +14,7 @@ load_dotenv()
 
 LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 82.95 # tổng vốn
+INITIAL_BALANCE = 95.91 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -784,6 +784,9 @@ class TradingBot:
             self.current_max_positions -= 1
 
             self.active_dca_symbol = symbol
+
+            # mở khóa sau khi DCA hoàn tất
+            self.active_dca_symbol = None
 
             send_telegram(
                 f"📉 DCA lần {pos['dca_count']} cho {symbol}\n"
