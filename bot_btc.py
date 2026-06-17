@@ -13,8 +13,8 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 20 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 95.91 # tổng vốn
+DEFAULT_TRADE_AMOUNT = 10 # vốn vào lệnh
+INITIAL_BALANCE = 433.27 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
