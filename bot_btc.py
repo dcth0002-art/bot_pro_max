@@ -30,7 +30,7 @@ MAX_DCA = 4
 # --- BB DYNAMIC MIN_PERCENT THEO KHUNG 1M ---
 BB_1M_CANDLE_THRESHOLD = 12 # nếu khung 1M có dưới 12 nến thì dùng min_percent cao hơn
 BB_MIN_PERCENT_LOW_HISTORY = 200 # coin mới / ít dữ liệu 1M
-BB_MIN_PERCENT_ENOUGH_HISTORY = 170 # coin có trên hoặc bằng 12 nến 1M
+BB_MIN_PERCENT_ENOUGH_HISTORY = 160 # coin có trên hoặc bằng 12 nến 1M
 BB_1M_CACHE_SECONDS = 6 * 60 * 60 # cache 6 tiếng để tránh gọi API quá nhiều
 
 # --- TRAILING TP / CẮT BỚT LỆNH ÂM ---
@@ -41,9 +41,9 @@ LOSS_CUT_PROFIT_USAGE = 0.25 # dùng tối đa 25% tiền lời TP để cắt l
 MIN_PARTIAL_CLOSE_AMOUNT_RATIO = 0.05 # không đóng từng phần quá nhỏ dưới 5% khối lượng lệnh
 
 # --- BƠM LẠI LỆNH ĐÃ BỊ CẮT NHỎ ---
-REBUILD_TRIGGER_TRADE_AMOUNT = 2 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
-REBUILD_ADD_AMOUNT = 6 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
-REBUILD_MIN_LOSS_PERCENT = 20 # chỉ bơm lại nếu lệnh nhỏ vẫn đang âm ít nhất 20% ký quỹ
+REBUILD_TRIGGER_TRADE_AMOUNT = 0.5 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
+REBUILD_ADD_AMOUNT = 1.5 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
+REBUILD_MIN_LOSS_PERCENT = 70 # chỉ bơm lại nếu lệnh nhỏ vẫn đang âm ít nhất 20% ký quỹ
 
 # --- THÔNG TIN TELEGRAM ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
