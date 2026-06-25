@@ -13,10 +13,10 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 20 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 10 # vốn vào lệnh
-INITIAL_BALANCE = 433.27 # tổng vốn
+DEFAULT_TRADE_AMOUNT = 2 # vốn vào lệnh
+INITIAL_BALANCE = 425.80 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
-WARMUP_PERIOD = 3000000000000000 # tích dữ liệu giá
+WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
 COOLDOWN_PERIOD = 600 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
@@ -26,6 +26,24 @@ STATUS_REPORT_INTERVAL = 1200 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
 MAX_POSITIONS = 5 # số lệnh tối đa cùng lúc
 MAX_DCA = 4
+
+# --- BB DYNAMIC MIN_PERCENT THEO KHUNG 1M ---
+BB_1M_CANDLE_THRESHOLD = 12 # nếu khung 1M có dưới 12 nến thì dùng min_percent cao hơn
+BB_MIN_PERCENT_LOW_HISTORY = 200 # coin mới / ít dữ liệu 1M
+BB_MIN_PERCENT_ENOUGH_HISTORY = 170 # coin có trên hoặc bằng 12 nến 1M
+BB_1M_CACHE_SECONDS = 6 * 60 * 60 # cache 6 tiếng để tránh gọi API quá nhiều
+
+# --- TRAILING TP / CẮT BỚT LỆNH ÂM ---
+TRAILING_TP_CALLBACK_RATIO = 0.30 # tụt 30% phần lời dùng làm khoảng kéo SL dương
+TRAILING_TP_MIN_GAP = 0.20 # tối thiểu cho giá thở, đơn vị USDT
+LOSS_CUT_TRIGGER_PERCENT = 70 # lệnh âm trên 70% ký quỹ thì xét cắt bớt
+LOSS_CUT_PROFIT_USAGE = 0.25 # dùng tối đa 25% tiền lời TP để cắt lỗ, TP 2$ => cắt khoảng 0.5$
+MIN_PARTIAL_CLOSE_AMOUNT_RATIO = 0.05 # không đóng từng phần quá nhỏ dưới 5% khối lượng lệnh
+
+# --- BƠM LẠI LỆNH ĐÃ BỊ CẮT NHỎ ---
+REBUILD_TRIGGER_TRADE_AMOUNT = 2 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
+REBUILD_ADD_AMOUNT = 6 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
+REBUILD_MIN_LOSS_PERCENT = 20 # chỉ bơm lại nếu lệnh nhỏ vẫn đang âm ít nhất 20% ký quỹ
 
 # --- THÔNG TIN TELEGRAM ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -94,6 +112,7 @@ class TradingBot:
         self.start_time = time.time()
         self.last_status_time = time.time()
         self.is_warmed_up = False
+        self.bb_1m_cache = {}
 
     def update_coin_data(self, symbol):
         try:
@@ -172,6 +191,75 @@ class TradingBot:
             return current_price <= lower_zone
 
         return False
+
+    def calculate_virtual_pnl(self, pos, current_price):
+
+        market = exchange.market(pos['symbol'])
+
+        contract_size = float(
+            market.get("contractSize") or 1
+        )
+
+        entry_price = pos['entry_price']
+        amount_coin = pos['amount_coin']
+
+        if pos['side'] == 'buy':
+            pnl = (
+                current_price - entry_price
+            ) * amount_coin * contract_size
+        else:
+            pnl = (
+                entry_price - current_price
+            ) * amount_coin * contract_size
+
+        return pnl
+
+    def get_dynamic_bb_min_percent(self, symbol):
+
+        # Kiểm tra số nến khung 1M của coin.
+        # Coin có lịch sử 1M ngắn (< 12 nến) thì yêu cầu BB mở rộng mạnh hơn.
+        now = time.time()
+
+        cached = self.bb_1m_cache.get(symbol)
+
+        if cached and now - cached['time'] < BB_1M_CACHE_SECONDS:
+            return cached['min_percent']
+
+        try:
+
+            monthly_ohlcv = exchange.fetch_ohlcv(
+                symbol,
+                timeframe='1M',
+                limit=20
+            )
+
+            candle_count = len(monthly_ohlcv)
+
+            if candle_count < BB_1M_CANDLE_THRESHOLD:
+                min_percent = BB_MIN_PERCENT_LOW_HISTORY
+            else:
+                min_percent = BB_MIN_PERCENT_ENOUGH_HISTORY
+
+            self.bb_1m_cache[symbol] = {
+                'time': now,
+                'candle_count': candle_count,
+                'min_percent': min_percent
+            }
+
+            print(
+                f"📊 [{symbol}] 1M có {candle_count} nến => BB min_percent={min_percent}"
+            )
+
+            return min_percent
+
+        except Exception as e:
+
+            print(
+                f"⚠️ Không kiểm tra được nến 1M của {symbol}: {e}"
+            )
+
+            # Nếu lỗi API thì dùng mức an toàn hơn.
+            return BB_MIN_PERCENT_LOW_HISTORY
 
     def is_boll_expanding_smooth(
         self,
@@ -344,8 +432,11 @@ class TradingBot:
                                             print(f"⌛ [{symbol}] SELL chờ chạm BB trên...")
                                             continue
 
+                                        bb_min_percent = self.get_dynamic_bb_min_percent(symbol)
+
                                         bb_expand = self.is_boll_expanding_smooth(
-                                            c['price_history']
+                                            c['price_history'],
+                                            min_percent=bb_min_percent
                                         )
 
                                         # ===== BB chưa đạt =====
@@ -421,8 +512,11 @@ class TradingBot:
                                             print(f"⌛ [{symbol}] BUY chờ chạm BB dưới...")
                                             continue
 
+                                        bb_min_percent = self.get_dynamic_bb_min_percent(symbol)
+
                                         bb_expand = self.is_boll_expanding_smooth(
-                                            c['price_history']
+                                            c['price_history'],
+                                            min_percent=bb_min_percent
                                         )
 
                                         # ===== BB chưa đạt =====
@@ -477,71 +571,115 @@ class TradingBot:
 
                 if current_price:
 
-                    positions = exchange.fetch_positions([symbol])
+                    unrealized_pnl = self.calculate_virtual_pnl(
+                        pos,
+                        current_price
+                    )
 
-                    if positions:
-                        unrealized_pnl = float(
-                            positions[0].get('unrealizedPnl') or 0
-                        )
-                    else:
-                        unrealized_pnl = 0
+                    # Chỉ lệnh gốc mới được kích hoạt các lần DCA.
+                    # Các lệnh DCA là lệnh riêng, TP riêng, không tự mở DCA tiếp.
+                    if not pos.get('is_dca_position'):
 
-                    first_price = pos['first_entry_price']
+                        first_price = pos['first_entry_price']
 
-                    if pos['side'] == 'buy':
+                        if pos['side'] == 'buy':
 
-                        loss_percent = (
-                            (first_price - current_price)
-                            / first_price
-                        ) * 100
+                            loss_percent = (
+                                (first_price - current_price)
+                                / first_price
+                            ) * 100
 
-                    else:
+                        else:
 
-                        loss_percent = (
-                            (current_price - first_price)
-                            / first_price
-                        ) * 100
+                            loss_percent = (
+                                (current_price - first_price)
+                                / first_price
+                            ) * 100
 
-                    next_dca_level = (
-                        pos['dca_count'] + 1
-                    ) * (100 / pos['leverage'])
+                        next_dca_level = (
+                            pos['dca_count'] + 1
+                        ) * (100 / pos['leverage'])
 
-                    if (
-                        loss_percent >= next_dca_level
-                        and not pos['waiting_dca']
-                        and pos['dca_count'] < MAX_DCA
-                    ):
+                        if (
+                            loss_percent >= next_dca_level
+                            and not pos['waiting_dca']
+                            and pos['dca_count'] < MAX_DCA
+                        ):
 
-                        pos['waiting_dca'] = True
+                            pos['waiting_dca'] = True
 
-                        send_telegram(
-                            f"⚠️ {symbol} đạt ngưỡng DCA {pos['dca_count']+1}, chờ DCA"
-                        )
+                            send_telegram(
+                                f"⚠️ {symbol} đạt ngưỡng DCA {pos['dca_count']+1}, chờ mở lệnh DCA riêng"
+                            )
 
                     exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
 
                     total_fee = pos['entry_fee'] + exit_fee
 
-                    if pos['is_dca_position']:
+                    target_profit = (
+                        (pos['trade_amount'] * pos['leverage']) * 0.01
+                    ) + total_fee
 
-                        target_profit = total_fee
+                    # ===== TRAILING TP KIỂU SL DƯƠNG =====
+                    # Vẫn giữ mốc TP cũ. Khi đạt TP thì chưa đóng ngay,
+                    # mà bật trailing để lợi nhuận còn tăng thì tiếp tục giữ.
+                    if not pos.get('tp_trailing_active'):
+
+                        if unrealized_pnl >= target_profit:
+
+                            pos['tp_trailing_active'] = True
+                            pos['tp_peak_pnl'] = unrealized_pnl
+                            pos['tp_trailing_stop_pnl'] = target_profit
+
+                            send_telegram(
+                                f"🟢 {symbol} đã vào vùng TP, bật trailing TP\n"
+                                f"🎯 TP gốc: `${target_profit:.4f}`\n"
+                                f"📈 Lời hiện tại: `${unrealized_pnl:.4f}`"
+                            )
 
                     else:
 
-                        target_profit = (
-                            (pos['trade_amount'] * pos['leverage']) * 0.01
-                        ) + total_fee
+                        if unrealized_pnl > pos.get('tp_peak_pnl', 0):
 
-                    if unrealized_pnl >= target_profit:
+                            pos['tp_peak_pnl'] = unrealized_pnl
 
-                        self.close_position(
-                            pos,
-                            current_price,
-                            "Chốt lời (TP) 1%"
-                        )
+                            trail_gap = max(
+                                target_profit * TRAILING_TP_CALLBACK_RATIO,
+                                TRAILING_TP_MIN_GAP
+                            )
+
+                            pos['tp_trailing_stop_pnl'] = max(
+                                target_profit,
+                                pos['tp_peak_pnl'] - trail_gap
+                            )
+
+                            print(
+                                f"📈 {symbol} trailing TP peak={pos['tp_peak_pnl']:.4f}, "
+                                f"stop={pos['tp_trailing_stop_pnl']:.4f}"
+                            )
+
+                        if unrealized_pnl <= pos.get('tp_trailing_stop_pnl', target_profit):
+
+                            closed_profit = self.close_position(
+                                pos,
+                                current_price,
+                                "Trailing TP - lợi nhuận yếu đi nên chốt"
+                            )
+
+                            if closed_profit and closed_profit > 0:
+
+                                self.reduce_biggest_loser_after_tp(
+                                    closed_profit
+                                )
 
                     #elif unrealized_pnl <= -self.current_trade_amount:
                         #self.close_position(current_price, "Cháy tài khoản (SL 100%)")
+
+            # Sau khi các lệnh âm bị cắt nhỏ, nếu lệnh còn khoảng 2$
+            # thì bơm thêm tiền để kéo lại giá trung bình cho lệnh đó.
+            for pos in self.positions[:]:
+
+                self.rebuild_small_loser_position(pos)
 
             for pos in self.positions:
 
@@ -671,7 +809,13 @@ class TradingBot:
 
                 'dca_count': 0,
                 'waiting_dca': False,
-                'is_dca_position': False
+                'is_dca_position': False,
+
+                'tp_trailing_active': False,
+                'tp_peak_pnl': 0,
+                'tp_trailing_stop_pnl': 0,
+
+                'rebuild_count': 0
             })
 
         except Exception as e:
@@ -706,7 +850,9 @@ class TradingBot:
 
         symbol = pos['symbol']
 
-        trade_amount = DEFAULT_TRADE_AMOUNT
+        trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
+
+        dca_number = pos['dca_count'] + 1
 
         try:
 
@@ -735,11 +881,21 @@ class TradingBot:
                 amount
             )
 
+            amount_coin = float(amount)
+
+            entry_fee = (
+                trade_amount *
+                pos['leverage']
+            ) * FEE_RATE
+
+            # Mở thêm 1 order cùng chiều, nhưng bot lưu thành 1 vị thế riêng.
+            # Lưu ý: trên OKX cùng symbol + cùng posSide vẫn gộp ngoài sàn,
+            # còn bot sẽ quản lý TP/đóng từng phần bằng reduceOnly.
             exchange.create_order(
                 symbol=symbol,
                 type='market',
                 side=pos['side'],
-                amount=float(amount),
+                amount=amount_coin,
                 params={
                     "tdMode": "cross",
                     "posSide": "long"
@@ -747,50 +903,49 @@ class TradingBot:
                     else "short"
                 }
             )
-            time.sleep(2)
-            positions = exchange.fetch_positions([symbol])
 
-            if positions:
+            self.balance -= entry_fee
 
-                pos['entry_price'] = float(
-                    positions[0]['entryPrice']
-                )
+            self.positions.append({
+                'symbol': symbol,
+                'side': pos['side'],
 
-                pos['amount_coin'] = float(
-                    positions[0]['contracts']
-                )
+                'entry_price': current_price,
+                'first_entry_price': current_price,
 
-                print(
-                    f"✅ Giá trung bình mới: {pos['entry_price']}"
-                )
+                'amount_coin': amount_coin,
+                'trade_amount': trade_amount,
+                'entry_fee': entry_fee,
+                'leverage': pos['leverage'],
 
-                print(
-                    f"✅ Khối lượng mới: {pos['amount_coin']}"
-                )
+                'dca_count': 0,
+                'waiting_dca': False,
+                'is_dca_position': True,
+                'dca_number': dca_number,
+                'parent_entry_price': pos['first_entry_price'],
 
-            pos['trade_amount'] += trade_amount
+                'tp_trailing_active': False,
+                'tp_peak_pnl': 0,
+                'tp_trailing_stop_pnl': 0,
 
-            pos['entry_fee'] += (
-                trade_amount *
-                pos['leverage']
-            ) * FEE_RATE
+                'rebuild_count': 0
+            })
 
-            pos['dca_count'] += 1
-
+            # Lệnh gốc chỉ ghi nhận đã mở DCA lần mấy,
+            # KHÔNG sửa entry_price, KHÔNG cộng trade_amount,
+            # KHÔNG kéo giá trung bình nữa.
+            pos['dca_count'] = dca_number
             pos['waiting_dca'] = False
 
-            pos['is_dca_position'] = True
-
-            self.current_max_positions -= 1
-
-            self.active_dca_symbol = symbol
-
-            # mở khóa sau khi DCA hoàn tất
-            self.active_dca_symbol = None
+            # DCA riêng đã được tính bằng len(self.positions).
+            # Không trừ current_max_positions nữa, nếu trừ sẽ làm bot bị chặn DCA sớm
+            # và không mở đủ MAX_DCA như mong muốn.
 
             send_telegram(
-                f"📉 DCA lần {pos['dca_count']} cho {symbol}\n"
-                f"📦 Slot còn: {self.current_max_positions}"
+                f"📉 Đã mở LỆNH DCA RIÊNG lần {dca_number} cho {symbol}\n"
+                f"💰 Giá DCA: `{current_price}`\n"
+                f"💵 Ký quỹ: `${trade_amount:,.2f}`\n"
+                f"📦 Số lệnh hiện tại: {len(self.positions)}/{self.current_max_positions}"
             )
 
             if pos['dca_count'] >= MAX_DCA:
@@ -798,15 +953,300 @@ class TradingBot:
                 self.bot_paused = True
 
                 send_telegram(
-                    f"🚨 {symbol} đã DCA tối đa {MAX_DCA} lần\n"
+                    f"🚨 {symbol} đã mở đủ {MAX_DCA} lệnh DCA riêng\n"
                     f"🚨 Bot tạm dừng để xử lý thủ công"
                 )
 
         except Exception as e:
 
+            pos['waiting_dca'] = False
+
             print(f"DCA lỗi: {e}")
 
+            send_telegram(
+                f"❌ Lỗi mở lệnh DCA riêng {symbol}:\n`{e}`"
+            )
 
+
+
+
+    def rebuild_small_loser_position(self, pos):
+
+        # Khi một lệnh bị các lần TP cắt bớt đến mức còn nhỏ,
+        # bot sẽ thêm tiền vào chính lệnh đó để kéo giá trung bình mới.
+        # Ví dụ lệnh ban đầu 10$, bị cắt còn khoảng 2$,
+        # bot thêm 6$ => lệnh còn khoảng 8$ và có entry_price trung bình mới.
+        if pos.get('trade_amount', 0) > REBUILD_TRIGGER_TRADE_AMOUNT:
+            return False
+
+        if pos.get('rebuilding'):
+            return False
+
+        if self.balance < REBUILD_ADD_AMOUNT:
+            print(
+                f"⌛ {pos['symbol']} còn nhỏ nhưng balance không đủ để bơm lại"
+            )
+            return False
+
+        symbol = pos['symbol']
+
+        current_price = self.update_coin_data(symbol)
+
+        if not current_price:
+            return False
+
+        current_pnl = self.calculate_virtual_pnl(
+            pos,
+            current_price
+        )
+
+        loss_percent = (
+            abs(current_pnl) / pos['trade_amount']
+        ) * 100 if pos['trade_amount'] > 0 else 0
+
+        # Chỉ bơm lại lệnh đang âm, tránh lệnh nhỏ nhưng đang gần hòa/lãi cũng bị bơm.
+        if current_pnl >= 0 or loss_percent < REBUILD_MIN_LOSS_PERCENT:
+            return False
+
+        pos['rebuilding'] = True
+
+        try:
+
+            trade_amount = REBUILD_ADD_AMOUNT
+
+            market = exchange.market(symbol)
+
+            contract_size = float(
+                market.get("contractSize") or 1
+            )
+
+            position_value = (
+                trade_amount *
+                pos['leverage']
+            )
+
+            amount = (
+                position_value /
+                (current_price * contract_size)
+            )
+
+            amount = exchange.amount_to_precision(
+                symbol,
+                amount
+            )
+
+            add_amount_coin = float(amount)
+
+            if add_amount_coin <= 0:
+                pos['rebuilding'] = False
+                return False
+
+            exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=pos['side'],
+                amount=add_amount_coin,
+                params={
+                    "tdMode": "cross",
+                    "posSide": "long"
+                    if pos['side'] == "buy"
+                    else "short"
+                }
+            )
+
+            old_amount_coin = pos['amount_coin']
+            old_entry_price = pos['entry_price']
+
+            new_amount_coin = old_amount_coin + add_amount_coin
+
+            # Giá trung bình riêng trong bot cho phần lệnh này.
+            new_entry_price = (
+                (old_entry_price * old_amount_coin) +
+                (current_price * add_amount_coin)
+            ) / new_amount_coin
+
+            entry_fee = (
+                trade_amount *
+                pos['leverage']
+            ) * FEE_RATE
+
+            pos['entry_price'] = new_entry_price
+            pos['first_entry_price'] = new_entry_price
+            pos['amount_coin'] = new_amount_coin
+            pos['trade_amount'] += trade_amount
+            pos['entry_fee'] += entry_fee
+            pos['rebuild_count'] = pos.get('rebuild_count', 0) + 1
+
+            # Sau khi kéo giá trung bình thì reset trailing TP để tính lại từ đầu.
+            pos['tp_trailing_active'] = False
+            pos['tp_peak_pnl'] = 0
+            pos['tp_trailing_stop_pnl'] = 0
+
+            self.balance -= entry_fee
+
+            send_telegram(
+                f"🧱 *BƠM LẠI LỆNH NHỎ*\n"
+                f"📍 `{symbol}`\n"
+                f"📉 Trước khi bơm đang âm: `{loss_percent:.1f}%` ký quỹ\n"
+                f"💵 Ký quỹ cũ còn: `${pos['trade_amount'] - trade_amount:.4f}`\n"
+                f"➕ Thêm ký quỹ: `${trade_amount:.2f}`\n"
+                f"📊 Ký quỹ mới: `${pos['trade_amount']:.4f}`\n"
+                f"🎯 Giá trung bình mới: `{new_entry_price}`"
+            )
+
+            pos['rebuilding'] = False
+
+            return True
+
+        except Exception as e:
+
+            pos['rebuilding'] = False
+
+            print(f"❌ Lỗi bơm lại lệnh nhỏ {symbol}: {e}")
+
+            send_telegram(
+                f"❌ Lỗi bơm lại lệnh nhỏ {symbol}:\n`{e}`"
+            )
+
+            return False
+
+
+    def reduce_biggest_loser_after_tp(self, tp_profit):
+
+        # Dùng một phần tiền lời vừa TP để cắt bớt lệnh âm nặng,
+        # mục tiêu là giảm khối lượng/ký quỹ của lệnh đang âm mà tổng vẫn còn lời.
+        loss_budget = tp_profit * LOSS_CUT_PROFIT_USAGE
+
+        if loss_budget <= 0:
+            return
+
+        biggest_loser = None
+        biggest_loser_price = None
+        biggest_loss = 0
+        biggest_loss_percent = 0
+
+        for p in self.positions:
+
+            current_price = self.update_coin_data(p['symbol'])
+
+            if not current_price:
+                continue
+
+            pnl = self.calculate_virtual_pnl(
+                p,
+                current_price
+            )
+
+            loss_percent = (
+                abs(pnl) / p['trade_amount']
+            ) * 100 if p['trade_amount'] > 0 else 0
+
+            if (
+                pnl < 0
+                and loss_percent >= LOSS_CUT_TRIGGER_PERCENT
+                and abs(pnl) > biggest_loss
+            ):
+
+                biggest_loser = p
+                biggest_loser_price = current_price
+                biggest_loss = abs(pnl)
+                biggest_loss_percent = loss_percent
+
+        if not biggest_loser:
+            return
+
+        symbol = biggest_loser['symbol']
+        close_side = 'sell' if biggest_loser['side'] == 'buy' else 'buy'
+
+        # Tính cả phí đóng ước tính vào ngân sách cắt lỗ.
+        full_exit_fee = (
+            biggest_loser['trade_amount'] *
+            biggest_loser['leverage']
+        ) * FEE_RATE
+
+        full_loss_with_fee = biggest_loss + full_exit_fee
+
+        if full_loss_with_fee <= 0:
+            return
+
+        close_ratio = loss_budget / full_loss_with_fee
+
+        close_ratio = min(close_ratio, 0.90)
+
+        if close_ratio < MIN_PARTIAL_CLOSE_AMOUNT_RATIO:
+
+            print(
+                f"⌛ {symbol} có lệnh âm {biggest_loss_percent:.1f}% nhưng phần cắt quá nhỏ, bỏ qua"
+            )
+
+            return
+
+        close_amount = biggest_loser['amount_coin'] * close_ratio
+
+        close_amount = exchange.amount_to_precision(
+            symbol,
+            close_amount
+        )
+
+        close_amount = float(close_amount)
+
+        if close_amount <= 0:
+            return
+
+        try:
+
+            exchange.create_market_order(
+                symbol,
+                close_side,
+                close_amount,
+                params={
+                    "tdMode": "cross",
+                    "reduceOnly": True,
+                    "posSide": "long" if biggest_loser['side'] == "buy" else "short"
+                }
+            )
+
+        except Exception as e:
+
+            print(f"❌ Lỗi cắt bớt lệnh âm: {e}")
+
+            send_telegram(
+                f"❌ Lỗi cắt bớt lệnh âm {symbol}:\n`{e}`"
+            )
+
+            return
+
+        partial_loss = biggest_loss * close_ratio
+        partial_exit_fee = full_exit_fee * close_ratio
+        estimated_net_loss = partial_loss + partial_exit_fee
+
+        # Cập nhật position ảo của bot sau khi đóng một phần.
+        remain_ratio = 1 - close_ratio
+
+        biggest_loser['amount_coin'] *= remain_ratio
+        biggest_loser['trade_amount'] *= remain_ratio
+        biggest_loser['entry_fee'] *= remain_ratio
+
+        # Cắt bớt xong thì lệnh này không còn dùng trailing cũ nữa.
+        biggest_loser['tp_trailing_active'] = False
+        biggest_loser['tp_peak_pnl'] = 0
+        biggest_loser['tp_trailing_stop_pnl'] = 0
+
+        self.balance -= estimated_net_loss
+
+        send_telegram(
+            f"🧯 *CẮT BỚT LỆNH ÂM SAU TP*\n"
+            f"📍 Lệnh âm: `{symbol}`\n"
+            f"📉 Đang âm khoảng: `{biggest_loss_percent:.1f}%` ký quỹ\n"
+            f"💰 Lời TP vừa đóng: `${tp_profit:.4f}`\n"
+            f"✂️ Cắt lỗ một phần ước tính: `${estimated_net_loss:.4f}`\n"
+            f"📦 Đã đóng khoảng: `{close_ratio*100:.1f}%` khối lượng lệnh âm\n"
+            f"📊 Ký quỹ còn lại: `${biggest_loser['trade_amount']:.4f}`"
+        )
+
+        if biggest_loser['trade_amount'] <= REBUILD_TRIGGER_TRADE_AMOUNT:
+
+            self.rebuild_small_loser_position(biggest_loser)
 
 
     def close_position(self, pos, price, reason):
@@ -815,18 +1255,11 @@ class TradingBot:
         # Xác định chiều đóng lệnh
         close_side = 'sell' if pos['side'] == 'buy' else 'buy'
 
-        # Lấy PNL trước khi đóng lệnh
-        positions = exchange.fetch_positions([symbol])
-
-        if positions:
-
-            raw_pnl = float(
-                positions[0].get('unrealizedPnl') or 0
-            )
-
-        else:
-
-            raw_pnl = 0
+        # PNL riêng của vị thế bot đang đóng
+        raw_pnl = self.calculate_virtual_pnl(
+            pos,
+            price
+        )
 
         # Đóng lệnh thật trên OKX
         try:
@@ -851,7 +1284,7 @@ class TradingBot:
                 f"❌ Lỗi đóng lệnh thật {symbol}:\n`{e}`"
             )
 
-            return
+            return 0
 
         exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
 
@@ -874,7 +1307,11 @@ class TradingBot:
         )
 
         send_telegram(msg)
-        if pos['dca_count'] > 0:
+        # Reset position
+        self.positions.remove(pos)
+
+        # Nếu đã đóng hết các lệnh DCA/gốc của symbol này thì mở lại slot bình thường
+        if not any(p['symbol'] == symbol for p in self.positions):
 
             self.current_max_positions = MAX_POSITIONS
 
@@ -882,8 +1319,7 @@ class TradingBot:
 
             self.bot_paused = False
 
-        # Reset position
-        self.positions.remove(pos)
+        return real_net_profit
 
     def send_multi_report(self):
 
