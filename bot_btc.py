@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from collections import deque
 import numpy as np
 import traceback
+import threading
 
 # Load biến môi trường
 load_dotenv()
@@ -13,8 +14,8 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 20 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 10 # vốn vào lệnh
-INITIAL_BALANCE = 431.98 # tổng vốn
+DEFAULT_TRADE_AMOUNT = 2 # vốn vào lệnh
+INITIAL_BALANCE = 421.99 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -24,8 +25,8 @@ CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
 STATUS_REPORT_INTERVAL = 1200 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
-MAX_POSITIONS = 5 # số lệnh tối đa cùng lúc
-MAX_DCA = 4
+MAX_POSITIONS = 10 # số lệnh tối đa cùng lúc
+MAX_DCA = 10
 
 # --- BB DYNAMIC MIN_PERCENT THEO KHUNG 1M ---
 BB_1M_CANDLE_THRESHOLD = 12 # nếu khung 1M có dưới 12 nến thì dùng min_percent cao hơn
@@ -41,9 +42,9 @@ LOSS_CUT_PROFIT_USAGE = 0.25 # dùng tối đa 25% tiền lời TP để cắt l
 MIN_PARTIAL_CLOSE_AMOUNT_RATIO = 0.05 # không đóng từng phần quá nhỏ dưới 5% khối lượng lệnh
 
 # --- BƠM LẠI LỆNH ĐÃ BỊ CẮT NHỎ ---
-REBUILD_TRIGGER_TRADE_AMOUNT = 2 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
-REBUILD_ADD_AMOUNT = 6 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
-REBUILD_MIN_LOSS_PERCENT = 70 # chỉ bơm lại nếu lệnh nhỏ vẫn đang âm ít nhất 20% ký quỹ
+REBUILD_TRIGGER_TRADE_AMOUNT = 0.5 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
+REBUILD_ADD_AMOUNT = 1.5 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
+REBUILD_MIN_LOSS_PERCENT = 70 # chỉ bơm lại nếu lệnh nhỏ vẫn đang âm ít nhất 70% ký quỹ
 
 # --- THÔNG TIN TELEGRAM ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -72,6 +73,8 @@ for s in SYMBOLS[:20]:
 
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
+ACTIVE_TRADING_BOT = None
+TELEGRAM_POLLING_STARTED = False
 
 def send_telegram(message):
     print(message)
@@ -113,6 +116,79 @@ class TradingBot:
         self.last_status_time = time.time()
         self.is_warmed_up = False
         self.bb_1m_cache = {}
+
+        # D/T Telegram: D = dừng săn lệnh mới, T = tiếp tục săn lệnh mới.
+        # Các lệnh đang mở vẫn được quản lý TP/DCA/cắt lỗ bình thường.
+        self.search_paused = False
+
+        global ACTIVE_TRADING_BOT
+        ACTIVE_TRADING_BOT = self
+
+        self.setup_telegram_commands()
+
+    def count_root_positions(self):
+        # Chỉ đếm lệnh gốc để giới hạn slot săn lệnh mới.
+        # Lệnh DCA riêng không chiếm slot, nên full 5/5 vẫn DCA được.
+        return sum(
+            1 for pos in self.positions
+            if not pos.get('is_dca_position')
+        )
+
+    def setup_telegram_commands(self):
+        global TELEGRAM_POLLING_STARTED
+
+        if not bot:
+            return
+
+        if TELEGRAM_POLLING_STARTED:
+            return
+
+        @bot.message_handler(func=lambda message: True)
+        def handle_telegram_command(message):
+            try:
+                if TELEGRAM_CHAT_ID and str(message.chat.id) != str(TELEGRAM_CHAT_ID):
+                    return
+
+                text = (message.text or '').strip().upper()
+                active_bot = ACTIVE_TRADING_BOT
+
+                if active_bot is None:
+                    return
+
+                if text == 'D':
+                    active_bot.search_paused = True
+                    send_telegram(
+                        "⏸ *ĐÃ DỪNG SĂN LỆNH MỚI*\n"
+                        "Bot vẫn quản lý các lệnh đang chạy: TP, trailing TP, DCA, cắt lỗ."
+                    )
+
+                elif text == 'T':
+                    active_bot.search_paused = False
+                    send_telegram(
+                        "▶️ *ĐÃ TIẾP TỤC SĂN LỆNH MỚI*"
+                    )
+
+            except Exception as e:
+                print(f"Lỗi xử lý lệnh Telegram: {e}")
+
+        def polling_worker():
+            while True:
+                try:
+                    bot.infinity_polling(
+                        timeout=20,
+                        long_polling_timeout=20,
+                        skip_pending=True
+                    )
+                except Exception as e:
+                    print(f"Telegram polling lỗi: {e}")
+                    time.sleep(5)
+
+        threading.Thread(
+            target=polling_worker,
+            daemon=True
+        ).start()
+
+        TELEGRAM_POLLING_STARTED = True
 
     def update_coin_data(self, symbol):
         try:
@@ -345,7 +421,7 @@ class TradingBot:
         return True
 
     def run(self):
-        send_telegram(f"🚀 *Bé nhà đã dậy*\n- đang nạp dữ liệu")
+        send_telegram(f"🚀 *Bé nhà đã dậy*\n- đang nạp dữ liệu\n- Nhắn D để dừng săn lệnh mới, T để tiếp tục")
         
         while True:
 
@@ -367,7 +443,9 @@ class TradingBot:
                     continue
 
             # --- TRƯỜNG HỢP 1: ĐI SĂN TÍN HIỆU ---
-            if len(self.positions) < self.current_max_positions:
+            # Chỉ slot lệnh gốc mới giới hạn tìm lệnh mới.
+            # Lệnh DCA riêng không tính vào slot này.
+            if (not self.search_paused) and self.count_root_positions() < self.current_max_positions:
                 for symbol in SYMBOLS:
                     current_price = self.update_coin_data(symbol)
                     if current_price is None: continue
@@ -689,9 +767,7 @@ class TradingBot:
                 if self.active_dca_symbol:
                     continue
 
-                if len(self.positions) >= self.current_max_positions:
-                    continue
-
+                # DCA riêng không bị chặn bởi slot 5/5 lệnh gốc.
                 self.execute_dca(pos)
 
                 break
@@ -945,7 +1021,8 @@ class TradingBot:
                 f"📉 Đã mở LỆNH DCA RIÊNG lần {dca_number} cho {symbol}\n"
                 f"💰 Giá DCA: `{current_price}`\n"
                 f"💵 Ký quỹ: `${trade_amount:,.2f}`\n"
-                f"📦 Số lệnh hiện tại: {len(self.positions)}/{self.current_max_positions}"
+                f"📦 Slot lệnh gốc: {self.count_root_positions()}/{self.current_max_positions}\n"
+                f"📌 Tổng lệnh bot đang quản lý: {len(self.positions)}"
             )
 
             if pos['dca_count'] >= MAX_DCA:
@@ -1336,11 +1413,15 @@ class TradingBot:
 
             status_text = "Đang săn tín hiệu đảo chiều..."
 
+        search_status = "⏸ Đang dừng săn lệnh mới" if self.search_paused else "▶️ Đang săn lệnh mới"
+
         msg = (
             f"📊 *GIÁM SÁT HỆ THỐNG*\n"
             f"📍 {status_text}\n"
+            f"{search_status}\n"
             f"🏦 Vốn: `${self.balance:,.2f}$`\n"
-            f"📦 Số lệnh: `{len(self.positions)}/{MAX_POSITIONS}`"
+            f"📦 Slot lệnh gốc: `{self.count_root_positions()}/{MAX_POSITIONS}`\n"
+            f"📌 Tổng lệnh bot đang quản lý: `{len(self.positions)}`"
         )
 
         send_telegram(msg)
