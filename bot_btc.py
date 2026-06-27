@@ -421,7 +421,7 @@ class TradingBot:
         return True
 
     def run(self):
-        send_telegram(f"🚀 *Bé nhà đã dậy*\n- đang nạp dữ liệu\n- Nhắn D để dừng săn lệnh mới, T để tiếp tục")
+        send_telegram(f"🚀 *Bé nhà đã dậy*\n- đang nạp dữ liệu")
         
         while True:
 
