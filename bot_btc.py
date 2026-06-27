@@ -14,7 +14,7 @@ load_dotenv()
 # --- CẤU HÌNH ---
 
 LEVERAGE = 20 # đòn bẩy
-DEFAULT_TRADE_AMOUNT = 2 # vốn vào lệnh
+DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
 INITIAL_BALANCE = 421.99 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
@@ -42,8 +42,8 @@ LOSS_CUT_PROFIT_USAGE = 0.25 # dùng tối đa 25% tiền lời TP để cắt l
 MIN_PARTIAL_CLOSE_AMOUNT_RATIO = 0.05 # không đóng từng phần quá nhỏ dưới 5% khối lượng lệnh
 
 # --- BƠM LẠI LỆNH ĐÃ BỊ CẮT NHỎ ---
-REBUILD_TRIGGER_TRADE_AMOUNT = 0.5 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
-REBUILD_ADD_AMOUNT = 1.5 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
+REBUILD_TRIGGER_TRADE_AMOUNT = 1 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
+REBUILD_ADD_AMOUNT = 3 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
 REBUILD_MIN_LOSS_PERCENT = 70 # chỉ bơm lại nếu lệnh nhỏ vẫn đang âm ít nhất 70% ký quỹ
 
 # --- THÔNG TIN TELEGRAM ---
