@@ -27,7 +27,7 @@ STATUS_REPORT_INTERVAL = 1800 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
 MAX_POSITIONS = 10 # số lệnh tối đa cùng lúc
 MAX_DCA = 10
-MARGIN_MODE = "isolated" # isolated = Cô lập trên OKX, cross = Chéo
+MARGIN_MODE = "cross" # isolated = Cô lập trên OKX, cross = Chéo
 
 # --- BB DYNAMIC MIN_PERCENT THEO KHUNG 1M ---
 BB_1M_CANDLE_THRESHOLD = 12 # nếu khung 1M có dưới 12 nến thì dùng min_percent cao hơn
