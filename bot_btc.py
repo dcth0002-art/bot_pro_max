@@ -15,7 +15,7 @@ load_dotenv()
 
 LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 421.99 # tổng vốn
+INITIAL_BALANCE = 422.25 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -23,10 +23,11 @@ COOLDOWN_PERIOD = 600 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
 CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
-STATUS_REPORT_INTERVAL = 1200 # thời gian gửi báo cáo
+STATUS_REPORT_INTERVAL = 1800 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
 MAX_POSITIONS = 10 # số lệnh tối đa cùng lúc
 MAX_DCA = 10
+MARGIN_MODE = "isolated" # isolated = Cô lập trên OKX, cross = Chéo
 
 # --- BB DYNAMIC MIN_PERCENT THEO KHUNG 1M ---
 BB_1M_CANDLE_THRESHOLD = 12 # nếu khung 1M có dưới 12 nến thì dùng min_percent cao hơn
@@ -37,7 +38,7 @@ BB_1M_CACHE_SECONDS = 6 * 60 * 60 # cache 6 tiếng để tránh gọi API quá 
 # --- TRAILING TP / CẮT BỚT LỆNH ÂM ---
 TRAILING_TP_CALLBACK_RATIO = 0.30 # tụt 30% phần lời dùng làm khoảng kéo SL dương
 TRAILING_TP_MIN_GAP = 0.20 # tối thiểu cho giá thở, đơn vị USDT
-LOSS_CUT_TRIGGER_PERCENT = 70 # lệnh âm trên 70% ký quỹ thì xét cắt bớt
+LOSS_CUT_TRIGGER_PERCENT = 50 # lệnh âm trên 50% ký quỹ thì xét cắt bớt
 LOSS_CUT_PROFIT_USAGE = 0.25 # dùng tối đa 25% tiền lời TP để cắt lỗ, TP 2$ => cắt khoảng 0.5$
 MIN_PARTIAL_CLOSE_AMOUNT_RATIO = 0.05 # không đóng từng phần quá nhỏ dưới 5% khối lượng lệnh
 
@@ -88,6 +89,7 @@ class TradingBot:
     def __init__(self):
         self.balance = INITIAL_BALANCE
         self.positions = []
+        self.next_position_id = 1
         self.current_max_positions = MAX_POSITIONS
         self.active_dca_symbol = None
         self.bot_paused = False
@@ -188,6 +190,43 @@ class TradingBot:
         ).start()
 
         TELEGRAM_POLLING_STARTED = True
+
+    def make_position_id(self):
+        position_id = self.next_position_id
+        self.next_position_id += 1
+        return position_id
+
+    def refresh_root_dca_count(self, root_id):
+        # DCA reset: nếu các lệnh DCA riêng đã TP/đóng hết,
+        # lệnh gốc sẽ quay về DCA0 để lần sau có thể mở lại DCA1.
+        root_pos = None
+
+        for p in self.positions:
+            if p.get('position_id') == root_id and not p.get('is_dca_position'):
+                root_pos = p
+                break
+
+        if not root_pos:
+            return
+
+        active_dca_numbers = [
+            p.get('dca_number', 0)
+            for p in self.positions
+            if p.get('root_id') == root_id and p.get('is_dca_position')
+        ]
+
+        new_dca_count = max(active_dca_numbers) if active_dca_numbers else 0
+
+        old_dca_count = root_pos.get('dca_count', 0)
+
+        root_pos['dca_count'] = new_dca_count
+        root_pos['waiting_dca'] = False
+
+        if new_dca_count == 0 and old_dca_count != 0:
+            send_telegram(
+                f"🔄 {root_pos['symbol']} DCA riêng đã đóng hết, reset về DCA0"
+            )
+
 
     def update_coin_data(self, symbol):
         try:
@@ -786,7 +825,7 @@ class TradingBot:
             exchange.set_leverage(
                 current_leverage,
                 symbol,
-                params={"mgnMode": "cross"}
+                params={"mgnMode": MARGIN_MODE}
             )
 
             print(f"✅ {symbol} dùng leverage x{current_leverage}")
@@ -802,7 +841,7 @@ class TradingBot:
                 exchange.set_leverage(
                     current_leverage,
                     symbol,
-                    params={"mgnMode": "cross"}
+                    params={"mgnMode": MARGIN_MODE}
                 )
 
                 print(f"✅ {symbol} chuyển sang leverage x10")
@@ -859,7 +898,7 @@ class TradingBot:
                 side=side,
                 amount=amount_coin,
                 params={
-                    "tdMode": "cross",
+                    "tdMode": MARGIN_MODE,
                     "posSide": "long"
                     if side == "buy"
                     else "short"
@@ -870,7 +909,11 @@ class TradingBot:
 
             print(f"✅ Đã mở lệnh thật: {symbol}")
 
+            position_id = self.make_position_id()
+
             self.positions.append({
+                'position_id': position_id,
+                'root_id': position_id,
                 'symbol': symbol,
                 'side': side,
 
@@ -972,7 +1015,7 @@ class TradingBot:
                 side=pos['side'],
                 amount=amount_coin,
                 params={
-                    "tdMode": "cross",
+                    "tdMode": MARGIN_MODE,
                     "posSide": "long"
                     if pos['side'] == "buy"
                     else "short"
@@ -981,7 +1024,12 @@ class TradingBot:
 
             self.balance -= entry_fee
 
+            dca_position_id = self.make_position_id()
+            root_id = pos.get('root_id', pos.get('position_id'))
+
             self.positions.append({
+                'position_id': dca_position_id,
+                'root_id': root_id,
                 'symbol': symbol,
                 'side': pos['side'],
 
@@ -1123,7 +1171,7 @@ class TradingBot:
                 side=pos['side'],
                 amount=add_amount_coin,
                 params={
-                    "tdMode": "cross",
+                    "tdMode": MARGIN_MODE,
                     "posSide": "long"
                     if pos['side'] == "buy"
                     else "short"
@@ -1276,7 +1324,7 @@ class TradingBot:
                 close_side,
                 close_amount,
                 params={
-                    "tdMode": "cross",
+                    "tdMode": MARGIN_MODE,
                     "reduceOnly": True,
                     "posSide": "long" if biggest_loser['side'] == "buy" else "short"
                 }
@@ -1344,7 +1392,7 @@ class TradingBot:
                 close_side,
                 pos['amount_coin'],
                 params={
-                    "tdMode": "cross",
+                    "tdMode": MARGIN_MODE,
                     "reduceOnly": True,
                     "posSide": "long" if pos['side'] == "buy" else "short"
                 }
@@ -1383,8 +1431,15 @@ class TradingBot:
         )
 
         send_telegram(msg)
+
+        was_dca_position = pos.get('is_dca_position')
+        root_id = pos.get('root_id')
+
         # Reset position
         self.positions.remove(pos)
+
+        if was_dca_position and root_id:
+            self.refresh_root_dca_count(root_id)
 
         # Nếu đã đóng hết các lệnh DCA/gốc của symbol này thì mở lại slot bình thường
         if not any(p['symbol'] == symbol for p in self.positions):
