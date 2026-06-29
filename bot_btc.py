@@ -15,7 +15,7 @@ load_dotenv()
 
 LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 422.25 # tổng vốn
+INITIAL_BALANCE = 434.22 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -43,9 +43,13 @@ LOSS_CUT_PROFIT_USAGE = 0.25 # dùng tối đa 25% tiền lời TP để cắt l
 MIN_PARTIAL_CLOSE_AMOUNT_RATIO = 0.05 # không đóng từng phần quá nhỏ dưới 5% khối lượng lệnh
 
 # --- BƠM LẠI LỆNH ĐÃ BỊ CẮT NHỎ ---
-REBUILD_TRIGGER_TRADE_AMOUNT = 1 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
-REBUILD_ADD_AMOUNT = 3 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
+REBUILD_TRIGGER_TRADE_AMOUNT = 2 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
+REBUILD_ADD_AMOUNT = 6 # số tiền ký quỹ thêm vào lệnh nhỏ để kéo lại giá trung bình
 REBUILD_MIN_LOSS_PERCENT = 70 # chỉ bơm lại nếu lệnh nhỏ vẫn đang âm ít nhất 70% ký quỹ
+
+# --- TỰ DỌN LỆNH QUÁ NHỎ ---
+TINY_POSITION_VALUE_USDT = 0.20 # nếu giá trị vị thế còn <= 0.20 USDT thì bot tự đóng/xóa khỏi quản lý
+TINY_POSITION_TRADE_AMOUNT = 0.05 # nếu ký quỹ ảo còn <= 0.05$ thì bot tự đóng/xóa khỏi quản lý
 
 # --- THÔNG TIN TELEGRAM ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -169,6 +173,11 @@ class TradingBot:
                         "NỂ LẮM MỚI LÀM TIẾP ĐẤY"
                     )
 
+                elif text:
+                    # Nhắn tên coin, ví dụ TURBO / WIF / TURBOUSDT,
+                    # bot sẽ gửi chi tiết lệnh gốc + các lệnh DCA đang quản lý.
+                    active_bot.send_symbol_position_info(text)
+
             except Exception as e:
                 print(f"Lỗi xử lý lệnh Telegram: {e}")
 
@@ -190,6 +199,70 @@ class TradingBot:
         ).start()
 
         TELEGRAM_POLLING_STARTED = True
+
+    def normalize_symbol_query(self, text):
+        query = (text or '').strip().upper()
+        query = query.replace('/USDT:USDT', '')
+        query = query.replace('/USDT', '')
+        query = query.replace('USDT', '')
+        query = query.replace('/', '')
+        query = query.replace(':', '')
+        return query
+
+    def symbol_base_name(self, symbol):
+        return symbol.split('/')[0].upper()
+
+    def send_symbol_position_info(self, text):
+        query = self.normalize_symbol_query(text)
+
+        if not query:
+            return
+
+        matched_positions = [
+            p for p in self.positions
+            if self.symbol_base_name(p['symbol']) == query
+        ]
+
+        if not matched_positions:
+            send_telegram(
+                f"🔎 Không thấy lệnh nào bot đang quản lý cho `{query}`"
+            )
+            return
+
+        matched_positions.sort(
+            key=lambda p: (
+                p.get('root_id', p.get('position_id', 0)),
+                0 if not p.get('is_dca_position') else p.get('dca_number', 0),
+                p.get('position_id', 0)
+            )
+        )
+
+        lines = [
+            f"📌 *THÔNG TIN LỆNH {query}*"
+        ]
+
+        for p in matched_positions:
+            current_price = self.update_coin_data(p['symbol'])
+            pnl = self.calculate_virtual_pnl(p, current_price) if current_price else 0
+            pnl_percent = (pnl / p['trade_amount']) * 100 if p.get('trade_amount', 0) > 0 else 0
+
+            if p.get('is_dca_position'):
+                label = f"DCA {p.get('dca_number', '?')}"
+            else:
+                label = "LỆNH GỐC"
+
+            lines.append(
+                
+                f"\n{label} - `{p['side'].upper()}`"
+                f"\n💰 Giá vào: `{p.get('entry_price', 0):,.8f}`"
+                f"\n💵 Ký quỹ còn: `${p.get('trade_amount', 0):.4f}`"
+                f"\n📦 Khối lượng bot giữ: `{p.get('amount_coin', 0)}`"
+                f"\n📈 PnL ước tính: `${pnl:.4f}` (`{pnl_percent:.1f}%`)"
+            )
+
+        send_telegram(
+            "\n".join(lines)[:3900]
+        )
 
     def make_position_id(self):
         position_id = self.next_position_id
@@ -736,57 +809,27 @@ class TradingBot:
                         (pos['trade_amount'] * pos['leverage']) * 0.01
                     ) + total_fee
 
-                    # ===== TRAILING TP KIỂU SL DƯƠNG =====
-                    # Vẫn giữ mốc TP cũ. Khi đạt TP thì chưa đóng ngay,
-                    # mà bật trailing để lợi nhuận còn tăng thì tiếp tục giữ.
-                    if not pos.get('tp_trailing_active'):
+                    # ===== TP THẲNG - KHÔNG TRAILING =====
+                    # Đạt TP là đóng luôn, không chờ trailing TP nữa.
+                    if unrealized_pnl >= target_profit:
 
-                        if unrealized_pnl >= target_profit:
+                        closed_profit = self.close_position(
+                            pos,
+                            current_price,
+                            "Chốt lời TP ngay"
+                        )
 
-                            pos['tp_trailing_active'] = True
-                            pos['tp_peak_pnl'] = unrealized_pnl
-                            pos['tp_trailing_stop_pnl'] = target_profit
+                        if closed_profit and closed_profit > 0:
 
-                            send_telegram(
-                                f"🟢 {symbol} đã vào vùng TP, bật trailing TP\n"
-                                f"🎯 TP gốc: `${target_profit:.4f}`\n"
-                                f"📈 Lời hiện tại: `${unrealized_pnl:.4f}`"
+                            self.reduce_biggest_loser_after_tp(
+                                closed_profit
                             )
 
-                    else:
+                        continue
 
-                        if unrealized_pnl > pos.get('tp_peak_pnl', 0):
-
-                            pos['tp_peak_pnl'] = unrealized_pnl
-
-                            trail_gap = max(
-                                target_profit * TRAILING_TP_CALLBACK_RATIO,
-                                TRAILING_TP_MIN_GAP
-                            )
-
-                            pos['tp_trailing_stop_pnl'] = max(
-                                target_profit,
-                                pos['tp_peak_pnl'] - trail_gap
-                            )
-
-                            print(
-                                f"📈 {symbol} trailing TP peak={pos['tp_peak_pnl']:.4f}, "
-                                f"stop={pos['tp_trailing_stop_pnl']:.4f}"
-                            )
-
-                        if unrealized_pnl <= pos.get('tp_trailing_stop_pnl', target_profit):
-
-                            closed_profit = self.close_position(
-                                pos,
-                                current_price,
-                                "Trailing TP - lợi nhuận yếu đi nên chốt"
-                            )
-
-                            if closed_profit and closed_profit > 0:
-
-                                self.reduce_biggest_loser_after_tp(
-                                    closed_profit
-                                )
+                    # Nếu lệnh còn quá nhỏ sau nhiều lần cắt, tự dọn để tránh bot quản lý rác.
+                    if self.close_tiny_position_if_needed(pos, current_price):
+                        continue
 
                     #elif unrealized_pnl <= -self.current_trade_amount:
                         #self.close_position(current_price, "Cháy tài khoản (SL 100%)")
@@ -1368,9 +1411,90 @@ class TradingBot:
             f"📊 Ký quỹ còn lại: `${biggest_loser['trade_amount']:.4f}`"
         )
 
+        # Nếu phần còn lại quá nhỏ thì dọn luôn, không để rác trên OKX/bot.
+        if self.close_tiny_position_if_needed(biggest_loser, biggest_loser_price):
+            return
+
         if biggest_loser['trade_amount'] <= REBUILD_TRIGGER_TRADE_AMOUNT:
 
             self.rebuild_small_loser_position(biggest_loser)
+
+
+    def remove_position_from_memory(self, pos):
+        was_dca_position = pos.get('is_dca_position')
+        root_id = pos.get('root_id')
+        symbol = pos.get('symbol')
+
+        if pos in self.positions:
+            self.positions.remove(pos)
+
+        if was_dca_position and root_id:
+            self.refresh_root_dca_count(root_id)
+
+        if symbol and not any(p['symbol'] == symbol for p in self.positions):
+            self.current_max_positions = MAX_POSITIONS
+            self.active_dca_symbol = None
+            self.bot_paused = False
+
+    def close_tiny_position_if_needed(self, pos, current_price):
+        # Dọn các mảnh vị thế còn quá nhỏ sau nhiều lần cắt lỗ một phần.
+        # Mục tiêu: tránh kiểu OKX còn hiện khối lượng bé xíu, ký quỹ gần 0,
+        # còn bot thì vẫn quản lý và báo cáo như một lệnh bình thường.
+        if not current_price:
+            return False
+
+        try:
+            market = exchange.market(pos['symbol'])
+            contract_size = float(market.get("contractSize") or 1)
+            position_value = abs(pos.get('amount_coin', 0)) * current_price * contract_size
+
+            if (
+                pos.get('trade_amount', 0) > TINY_POSITION_TRADE_AMOUNT
+                and position_value > TINY_POSITION_VALUE_USDT
+            ):
+                return False
+
+            symbol = pos['symbol']
+            close_side = 'sell' if pos['side'] == 'buy' else 'buy'
+            close_amount = exchange.amount_to_precision(
+                symbol,
+                pos.get('amount_coin', 0)
+            )
+            close_amount = float(close_amount)
+
+            if close_amount > 0:
+                try:
+                    exchange.create_market_order(
+                        symbol,
+                        close_side,
+                        close_amount,
+                        params={
+                            "tdMode": MARGIN_MODE,
+                            "reduceOnly": True,
+                            "posSide": "long" if pos['side'] == "buy" else "short"
+                        }
+                    )
+                    send_telegram(
+                        f"🧹 *DỌN LỆNH QUÁ NHỎ*\n"
+                        f"📍 `{symbol}`\n"
+                        f"💵 Ký quỹ ảo còn: `${pos.get('trade_amount', 0):.6f}`\n"
+                        f"📦 Giá trị vị thế còn khoảng: `${position_value:.6f}`\n"
+                        f"✅ Đã gửi lệnh đóng phần còn lại."
+                    )
+                except Exception as e:
+                    # Nếu sàn từ chối vì amount quá nhỏ, bot xóa khỏi bộ nhớ để khỏi quản lý sai.
+                    send_telegram(
+                        f"🧹 *XÓA LỆNH QUÁ NHỎ KHỎI BOT*\n"
+                        f"📍 `{symbol}`\n"
+                        f"⚠️ Sàn không cho đóng vì quá nhỏ hoặc đã hết vị thế:\n`{e}`"
+                    )
+
+            self.remove_position_from_memory(pos)
+            return True
+
+        except Exception as e:
+            print(f"Lỗi dọn lệnh quá nhỏ: {e}")
+            return False
 
 
     def close_position(self, pos, price, reason):
@@ -1432,23 +1556,7 @@ class TradingBot:
 
         send_telegram(msg)
 
-        was_dca_position = pos.get('is_dca_position')
-        root_id = pos.get('root_id')
-
-        # Reset position
-        self.positions.remove(pos)
-
-        if was_dca_position and root_id:
-            self.refresh_root_dca_count(root_id)
-
-        # Nếu đã đóng hết các lệnh DCA/gốc của symbol này thì mở lại slot bình thường
-        if not any(p['symbol'] == symbol for p in self.positions):
-
-            self.current_max_positions = MAX_POSITIONS
-
-            self.active_dca_symbol = None
-
-            self.bot_paused = False
+        self.remove_position_from_memory(pos)
 
         return real_net_profit
 
@@ -1471,7 +1579,6 @@ class TradingBot:
 
         msg = (
             f"📊 *GIÁM SÁT HỆ THỐNG*\n"
-            f"📍 {status_text}\n"
             f"{search_status}\n"
             f"🏦 Vốn: `${self.balance:,.2f}$`\n"
             f"📦 Slot lệnh gốc: `{self.count_root_positions()}/{MAX_POSITIONS}`\n"
