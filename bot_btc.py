@@ -15,9 +15,9 @@ load_dotenv()
 
 LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 434.22 # tổng vốn
+INITIAL_BALANCE = 485.23 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
-WARMUP_PERIOD = 30000000000000000000 # tích dữ liệu giá
+WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
 COOLDOWN_PERIOD = 600 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
@@ -50,6 +50,15 @@ REBUILD_MIN_LOSS_PERCENT = 70 # chỉ bơm lại nếu lệnh nhỏ vẫn đang 
 # --- TỰ DỌN LỆNH QUÁ NHỎ ---
 TINY_POSITION_VALUE_USDT = 0.20 # nếu giá trị vị thế còn <= 0.20 USDT thì bot tự đóng/xóa khỏi quản lý
 TINY_POSITION_TRADE_AMOUNT = 0.05 # nếu ký quỹ ảo còn <= 0.05$ thì bot tự đóng/xóa khỏi quản lý
+
+# --- TP CHỜ ĐỦ LỜI ĐỂ CẮT LỆNH ÂM ---
+WAIT_TP_UNTIL_CAN_CUT_LOSER = True # TP đạt rồi nhưng nếu có lệnh âm mà chưa đủ tiền cắt tối thiểu thì chờ thêm
+TP_WAIT_NOTIFY_COOLDOWN = 1200 # báo Telegram tối đa 1 lần mỗi 5 phút cho mỗi lệnh đang chờ TP
+
+# --- PHỤC HỒI KÝ QUỸ SAU KHI CẮT LỆNH ÂM ---
+RESTORE_CUT_POSITION_TO_ORIGINAL = True # sau khi dùng lời TP cắt lỗ, dùng phần lời còn lại bơm lệnh đó về mức ban đầu
+RESTORE_TARGET_TRADE_AMOUNT = DEFAULT_TRADE_AMOUNT # lệnh gốc/DCA đều phục hồi tối đa về 5$
+MIN_RESTORE_ADD_AMOUNT = 0.10 # nếu phần cần bơm lại dưới 0.10$ thì bỏ qua để tránh order quá nhỏ
 
 # --- THÔNG TIN TELEGRAM ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -809,9 +818,39 @@ class TradingBot:
                         (pos['trade_amount'] * pos['leverage']) * 0.01
                     ) + total_fee
 
-                    # ===== TP THẲNG - KHÔNG TRAILING =====
-                    # Đạt TP là đóng luôn, không chờ trailing TP nữa.
+                    # ===== TP THẲNG NHƯNG CÓ KIỂM TRA CẮT LỆNH ÂM =====
+                    # Đạt TP thì đóng luôn nếu không có lệnh âm cần cắt,
+                    # hoặc nếu tiền lời đã đủ để cắt tối thiểu một phần lệnh âm.
+                    # Nếu có lệnh âm nhưng lời TP chưa đủ cắt tối thiểu, bot giữ lệnh TP chạy thêm.
                     if unrealized_pnl >= target_profit:
+
+                        estimated_exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
+                        estimated_net_profit = unrealized_pnl - pos['entry_fee'] - estimated_exit_fee
+
+                        can_close_tp, cut_info = self.can_cut_loser_with_profit(
+                            estimated_net_profit
+                        )
+
+                        if WAIT_TP_UNTIL_CAN_CUT_LOSER and not can_close_tp:
+
+                            now = time.time()
+
+                            if now - pos.get('last_tp_wait_notify', 0) >= TP_WAIT_NOTIFY_COOLDOWN:
+
+                                pos['last_tp_wait_notify'] = now
+
+                                send_telegram(
+                                    f"⏳ *TP ĐẠT NHƯNG CHỜ THÊM LỜI ĐỂ CẮT LỆNH ÂM*\n"
+                                    f"📍 Lệnh TP: `{symbol}`\n"
+                                    f"💰 Lời ròng ước tính hiện tại: `${estimated_net_profit:.4f}`\n"
+                                    f"🎯 TP gốc cần: `${target_profit:.4f}` PnL chưa trừ phí\n"
+                                    f"🧯 Lệnh âm cần cắt: `{cut_info['symbol']}` âm `{cut_info['loss_percent']:.1f}%`\n"
+                                    f"💸 Ngân sách cắt hiện tại: `${cut_info['loss_budget']:.4f}`\n"
+                                    f"📦 Cắt được khoảng: `{cut_info['close_ratio']*100:.2f}%` / cần tối thiểu `{MIN_PARTIAL_CLOSE_AMOUNT_RATIO*100:.1f}%`\n"
+                                    f"✅ Cần lời ròng khoảng: `${cut_info['needed_profit']:.4f}` để TP + cắt được"
+                                )
+
+                            continue
 
                         closed_profit = self.close_position(
                             pos,
@@ -965,6 +1004,7 @@ class TradingBot:
 
                 'amount_coin': amount_coin,
                 'trade_amount': trade_amount,
+                'original_trade_amount': DEFAULT_TRADE_AMOUNT,
                 'entry_fee': entry_fee,
                 'leverage': current_leverage,
 
@@ -1081,6 +1121,7 @@ class TradingBot:
 
                 'amount_coin': amount_coin,
                 'trade_amount': trade_amount,
+                'original_trade_amount': DEFAULT_TRADE_AMOUNT,
                 'entry_fee': entry_fee,
                 'leverage': pos['leverage'],
 
@@ -1278,14 +1319,7 @@ class TradingBot:
             return False
 
 
-    def reduce_biggest_loser_after_tp(self, tp_profit):
-
-        # Dùng một phần tiền lời vừa TP để cắt bớt lệnh âm nặng,
-        # mục tiêu là giảm khối lượng/ký quỹ của lệnh đang âm mà tổng vẫn còn lời.
-        loss_budget = tp_profit * LOSS_CUT_PROFIT_USAGE
-
-        if loss_budget <= 0:
-            return
+    def find_biggest_loser_for_cut(self):
 
         biggest_loser = None
         biggest_loser_price = None
@@ -1304,9 +1338,11 @@ class TradingBot:
                 current_price
             )
 
+            trade_amount = p.get('trade_amount', 0)
+
             loss_percent = (
-                abs(pnl) / p['trade_amount']
-            ) * 100 if p['trade_amount'] > 0 else 0
+                abs(pnl) / trade_amount
+            ) * 100 if trade_amount > 0 else 0
 
             if (
                 pnl < 0
@@ -1318,6 +1354,204 @@ class TradingBot:
                 biggest_loser_price = current_price
                 biggest_loss = abs(pnl)
                 biggest_loss_percent = loss_percent
+
+        return biggest_loser, biggest_loser_price, biggest_loss, biggest_loss_percent
+
+    def can_cut_loser_with_profit(self, tp_profit):
+
+        # Kiểm tra trước khi TP: nếu đang có lệnh âm đủ điều kiện,
+        # lợi nhuận TP hiện tại có đủ để cắt tối thiểu không.
+        loss_budget = tp_profit * LOSS_CUT_PROFIT_USAGE
+
+        if loss_budget <= 0:
+            return True, None
+
+        biggest_loser, loser_price, biggest_loss, biggest_loss_percent = self.find_biggest_loser_for_cut()
+
+        # Không có lệnh âm đủ ngưỡng thì TP bình thường.
+        if not biggest_loser:
+            return True, None
+
+        full_exit_fee = (
+            biggest_loser['trade_amount'] *
+            biggest_loser['leverage']
+        ) * FEE_RATE
+
+        full_loss_with_fee = biggest_loss + full_exit_fee
+
+        if full_loss_with_fee <= 0:
+            return True, None
+
+        close_ratio = loss_budget / full_loss_with_fee
+
+        info = {
+            'symbol': biggest_loser['symbol'],
+            'loss_percent': biggest_loss_percent,
+            'biggest_loss': biggest_loss,
+            'loss_budget': loss_budget,
+            'close_ratio': close_ratio,
+            'needed_profit': (MIN_PARTIAL_CLOSE_AMOUNT_RATIO * full_loss_with_fee) / LOSS_CUT_PROFIT_USAGE if LOSS_CUT_PROFIT_USAGE > 0 else 0
+        }
+
+        if close_ratio < MIN_PARTIAL_CLOSE_AMOUNT_RATIO:
+            return False, info
+
+        return True, info
+
+
+    def restore_cut_position_to_original(self, pos, current_price, available_profit):
+
+        # Sau khi cắt bớt lệnh âm bằng tiền lời TP,
+        # nếu lệnh đó bị giảm ký quỹ thì dùng phần lời còn lại
+        # để bơm lại tối đa về mức ký quỹ ban đầu: 5$ cho lệnh gốc và DCA.
+        if not RESTORE_CUT_POSITION_TO_ORIGINAL:
+            return 0
+
+        if not pos or pos not in self.positions:
+            return 0
+
+        if not current_price:
+            return 0
+
+        if available_profit <= 0:
+            return 0
+
+        symbol = pos['symbol']
+
+        target_trade_amount = pos.get(
+            'original_trade_amount',
+            RESTORE_TARGET_TRADE_AMOUNT
+        )
+
+        # Không cho phục hồi quá 5$ theo yêu cầu hiện tại.
+        target_trade_amount = min(
+            target_trade_amount,
+            RESTORE_TARGET_TRADE_AMOUNT
+        )
+
+        current_trade_amount = pos.get('trade_amount', 0)
+
+        missing_amount = target_trade_amount - current_trade_amount
+
+        if missing_amount < MIN_RESTORE_ADD_AMOUNT:
+            return 0
+
+        restore_amount = min(
+            missing_amount,
+            available_profit
+        )
+
+        if restore_amount < MIN_RESTORE_ADD_AMOUNT:
+            return 0
+
+        try:
+
+            market = exchange.market(symbol)
+
+            contract_size = float(
+                market.get("contractSize") or 1
+            )
+
+            position_value = (
+                restore_amount *
+                pos['leverage']
+            )
+
+            amount = (
+                position_value /
+                (current_price * contract_size)
+            )
+
+            amount = exchange.amount_to_precision(
+                symbol,
+                amount
+            )
+
+            add_amount_coin = float(amount)
+
+            if add_amount_coin <= 0:
+                return 0
+
+            exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=pos['side'],
+                amount=add_amount_coin,
+                params={
+                    "tdMode": MARGIN_MODE,
+                    "posSide": "long"
+                    if pos['side'] == "buy"
+                    else "short"
+                }
+            )
+
+            old_amount_coin = pos['amount_coin']
+            old_entry_price = pos['entry_price']
+
+            new_amount_coin = old_amount_coin + add_amount_coin
+
+            new_entry_price = (
+                (old_entry_price * old_amount_coin) +
+                (current_price * add_amount_coin)
+            ) / new_amount_coin
+
+            entry_fee = (
+                restore_amount *
+                pos['leverage']
+            ) * FEE_RATE
+
+            old_trade_amount = pos.get('trade_amount', 0)
+
+            pos['entry_price'] = new_entry_price
+            pos['first_entry_price'] = new_entry_price
+            pos['amount_coin'] = new_amount_coin
+            pos['trade_amount'] += restore_amount
+            pos['entry_fee'] += entry_fee
+            pos['restore_count'] = pos.get('restore_count', 0) + 1
+
+            # Sau khi bơm lại thì reset trạng thái TP chờ để tính lại từ entry mới.
+            pos['tp_trailing_active'] = False
+            pos['tp_peak_pnl'] = 0
+            pos['tp_trailing_stop_pnl'] = 0
+            pos['last_tp_wait_notify'] = 0
+
+            self.balance -= entry_fee
+
+            label = f"DCA {pos.get('dca_number')}" if pos.get('is_dca_position') else "LỆNH GỐC"
+
+            send_telegram(
+                f"🧩 *PHỤC HỒI KÝ QUỸ SAU KHI CẮT LỖ*\n"
+                f"📍 `{symbol}` - {label}\n"
+                f"💵 Ký quỹ trước khi bơm: `${old_trade_amount:.4f}`\n"
+                f"➕ Bơm lại bằng lời TP: `${restore_amount:.4f}`\n"
+                f"📊 Ký quỹ sau khi bơm: `${pos['trade_amount']:.4f}` / `${target_trade_amount:.4f}`\n"
+                f"🎯 Giá trung bình bot mới: `{new_entry_price}`\n"
+                f"💸 Phí mở thêm ước tính: `${entry_fee:.4f}`"
+            )
+
+            return restore_amount
+
+        except Exception as e:
+
+            print(f"❌ Lỗi phục hồi ký quỹ {symbol}: {e}")
+
+            send_telegram(
+                f"❌ Lỗi phục hồi ký quỹ {symbol}:\n`{e}`"
+            )
+
+            return 0
+
+
+    def reduce_biggest_loser_after_tp(self, tp_profit):
+
+        # Dùng một phần tiền lời vừa TP để cắt bớt lệnh âm nặng,
+        # mục tiêu là giảm khối lượng/ký quỹ của lệnh đang âm mà tổng vẫn còn lời.
+        loss_budget = tp_profit * LOSS_CUT_PROFIT_USAGE
+
+        if loss_budget <= 0:
+            return
+
+        biggest_loser, biggest_loser_price, biggest_loss, biggest_loss_percent = self.find_biggest_loser_for_cut()
 
         if not biggest_loser:
             return
@@ -1414,6 +1648,22 @@ class TradingBot:
         # Nếu phần còn lại quá nhỏ thì dọn luôn, không để rác trên OKX/bot.
         if self.close_tiny_position_if_needed(biggest_loser, biggest_loser_price):
             return
+
+        # Dùng phần lời TP còn lại để bơm lại lệnh vừa bị cắt,
+        # tối đa đưa ký quỹ của lệnh đó về 5$.
+        remaining_tp_profit = max(
+            0,
+            tp_profit - estimated_net_loss
+        )
+
+        restored_amount = self.restore_cut_position_to_original(
+            biggest_loser,
+            biggest_loser_price,
+            remaining_tp_profit
+        )
+
+        if restored_amount:
+            remaining_tp_profit -= restored_amount
 
         if biggest_loser['trade_amount'] <= REBUILD_TRIGGER_TRADE_AMOUNT:
 
