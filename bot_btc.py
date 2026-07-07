@@ -15,11 +15,11 @@ load_dotenv()
 
 LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 485.23 # tổng vốn
+INITIAL_BALANCE = 466.88 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
-WARMUP_PERIOD = 300000000000000000000 # tích dữ liệu giá
+WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
-COOLDOWN_PERIOD = 600 # thời gian khóa coi sau khi trây xong
+COOLDOWN_PERIOD = 11 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
 CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
@@ -40,7 +40,7 @@ TRAILING_TP_CALLBACK_RATIO = 0.30 # tụt 30% phần lời dùng làm khoảng k
 TRAILING_TP_MIN_GAP = 0.20 # tối thiểu cho giá thở, đơn vị USDT
 LOSS_CUT_TRIGGER_PERCENT = 50 # lệnh âm trên 50% ký quỹ thì xét cắt bớt
 LOSS_CUT_PROFIT_USAGE = 0.25 # dùng tối đa 25% tiền lời TP để cắt lỗ, TP 2$ => cắt khoảng 0.5$
-MIN_PARTIAL_CLOSE_AMOUNT_RATIO = 0.05 # không đóng từng phần quá nhỏ dưới 5% khối lượng lệnh
+MIN_PARTIAL_CLOSE_AMOUNT_RATIO = 0.10 # không đóng từng phần quá nhỏ dưới 5% khối lượng lệnh
 
 # --- BƠM LẠI LỆNH ĐÃ BỊ CẮT NHỎ ---
 REBUILD_TRIGGER_TRADE_AMOUNT = 2 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
@@ -48,8 +48,8 @@ REBUILD_ADD_AMOUNT = 6 # số tiền ký quỹ thêm vào lệnh nhỏ để ké
 REBUILD_MIN_LOSS_PERCENT = 70 # chỉ bơm lại nếu lệnh nhỏ vẫn đang âm ít nhất 70% ký quỹ
 
 # --- TỰ DỌN LỆNH QUÁ NHỎ ---
-TINY_POSITION_VALUE_USDT = 0.20 # nếu giá trị vị thế còn <= 0.20 USDT thì bot tự đóng/xóa khỏi quản lý
-TINY_POSITION_TRADE_AMOUNT = 0.05 # nếu ký quỹ ảo còn <= 0.05$ thì bot tự đóng/xóa khỏi quản lý
+TINY_POSITION_VALUE_USDT = 0 # nếu giá trị vị thế còn <= 0.20 USDT thì bot tự đóng/xóa khỏi quản lý
+TINY_POSITION_TRADE_AMOUNT = 0 # nếu ký quỹ ảo còn <= 0.05$ thì bot tự đóng/xóa khỏi quản lý
 
 # --- TP CHỜ ĐỦ LỜI ĐỂ CẮT LỆNH ÂM ---
 WAIT_TP_UNTIL_CAN_CUT_LOSER = True # TP đạt rồi nhưng nếu có lệnh âm mà chưa đủ tiền cắt tối thiểu thì chờ thêm
