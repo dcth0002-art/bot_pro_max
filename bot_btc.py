@@ -15,7 +15,7 @@ load_dotenv()
 
 LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 5 # vốn vào lệnh
-INITIAL_BALANCE = 466.88 # tổng vốn
+INITIAL_BALANCE = 533.37 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # thời gian tính volume
@@ -103,7 +103,11 @@ class TradingBot:
         self.balance = INITIAL_BALANCE
         self.positions = []
         self.next_position_id = 1
-        self.current_max_positions = MAX_POSITIONS
+        # Cấu hình runtime có thể đổi qua Telegram.
+        self.default_trade_amount = float(DEFAULT_TRADE_AMOUNT)
+        self.max_positions = int(MAX_POSITIONS)
+        self.current_max_positions = self.max_positions
+
         self.active_dca_symbol = None
         self.bot_paused = False
         
@@ -181,6 +185,35 @@ class TradingBot:
                     send_telegram(
                         "NỂ LẮM MỚI LÀM TIẾP ĐẤY"
                     )
+
+                elif text.startswith('VON '):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].replace(',', '.'))
+                        if value <= 0:
+                            raise ValueError
+                        old_value = active_bot.default_trade_amount
+                        active_bot.default_trade_amount = value
+                        send_telegram(
+                            f"💵 Đã đổi vốn mỗi lệnh: `${old_value:g}` → `${value:g}`\n"
+                            f"📌 Chỉ áp dụng cho lệnh gốc/DCA mở từ bây giờ."
+                        )
+                    except Exception:
+                        send_telegram("⚠️ Cú pháp đúng: `VON 10`")
+
+                elif text.startswith('LENH '):
+                    try:
+                        value = int(float(text.split(maxsplit=1)[1].replace(',', '.')))
+                        if value <= 0:
+                            raise ValueError
+                        old_value = active_bot.max_positions
+                        active_bot.max_positions = value
+                        active_bot.current_max_positions = value
+                        send_telegram(
+                            f"📦 Đã đổi số slot lệnh gốc: `{old_value}` → `{value}`\n"
+                            f"📊 Hiện đang có: `{active_bot.count_root_positions()}/{value}`"
+                        )
+                    except Exception:
+                        send_telegram("⚠️ Cú pháp đúng: `LENH 10`")
 
                 elif text:
                     # Nhắn tên coin, ví dụ TURBO / WIF / TURBOUSDT,
@@ -897,99 +930,218 @@ class TradingBot:
                 self.last_status_time = current_time
             time.sleep(CHECK_INTERVAL)
 
-    def open_position(self, symbol, side, price, vol_diff):
 
-        # ===== TỰ ĐỘNG CHỌN ĐÒN BẨY =====
-        current_leverage = LEVERAGE
-
-        try:
-
-            exchange.set_leverage(
-                current_leverage,
-                symbol,
-                params={"mgnMode": MARGIN_MODE}
-            )
-
-            print(f"✅ {symbol} dùng leverage x{current_leverage}")
-
-        except Exception:
-
-            print(f"⚠️ {symbol} không hỗ trợ x{LEVERAGE}, thử x10...")
-
+    def resolve_order_fill_price(self, order, symbol, fallback_price):
+        """Lấy giá khớp RIÊNG của chính order vừa mở, không dùng giá trung bình vị thế OKX."""
+        def valid_price(value):
             try:
+                value = float(value)
+                return value if value > 0 else None
+            except Exception:
+                return None
 
-                current_leverage = 10
+        # Một số market order trả average ngay.
+        for key in ('average', 'price'):
+            price = valid_price((order or {}).get(key))
+            if price:
+                return price
 
+        order_id = (order or {}).get('id')
+        if order_id:
+            # Đợi OKX cập nhật trạng thái khớp.
+            for _ in range(5):
+                try:
+                    time.sleep(0.4)
+                    fresh_order = exchange.fetch_order(order_id, symbol)
+                    for key in ('average', 'price'):
+                        price = valid_price((fresh_order or {}).get(key))
+                        if price:
+                            return price
+                except Exception as e:
+                    print(f"⚠️ Chưa lấy được giá khớp order {order_id}: {e}")
+
+            # Dự phòng: tìm trade đúng order id.
+            try:
+                trades = exchange.fetch_my_trades(symbol, limit=50)
+                matched = [
+                    t for t in trades
+                    if str(t.get('order')) == str(order_id)
+                ]
+                if matched:
+                    total_amount = sum(float(t.get('amount') or 0) for t in matched)
+                    if total_amount > 0:
+                        return sum(
+                            float(t.get('price') or 0) * float(t.get('amount') or 0)
+                            for t in matched
+                        ) / total_amount
+            except Exception as e:
+                print(f"⚠️ Không lấy được trade theo order {order_id}: {e}")
+
+        # Không dùng entryPrice vị thế vì OKX gộp lệnh gốc + DCA.
+        return float(fallback_price)
+
+
+    def create_entry_order_with_leverage_fallback(
+        self,
+        symbol,
+        side,
+        price,
+        trade_amount,
+        preferred_leverage
+    ):
+        """
+        Mở lệnh và tự hạ leverage nếu OKX báo vượt giới hạn của coin.
+        Trả về: (order, leverage_thực_tế, amount_coin, entry_fee)
+        """
+        candidates = []
+
+        for lev in [preferred_leverage, LEVERAGE, 20, 10, 5, 3, 2, 1]:
+            try:
+                lev = int(lev)
+            except Exception:
+                continue
+
+            if lev > int(preferred_leverage):
+                continue
+
+            if lev > 0 and lev not in candidates:
+                candidates.append(lev)
+
+        last_error = None
+
+        for leverage_value in candidates:
+            try:
                 exchange.set_leverage(
-                    current_leverage,
+                    leverage_value,
                     symbol,
                     params={"mgnMode": MARGIN_MODE}
                 )
 
-                print(f"✅ {symbol} chuyển sang leverage x10")
+                market = exchange.market(symbol)
 
-            except Exception as e:
-
-                print(f"❌ Không set được leverage cho {symbol}: {e}")
-
-                send_telegram(
-                    f"❌ {symbol} không hỗ trợ leverage phù hợp"
+                contract_size = float(
+                    market.get("contractSize") or 1
                 )
 
-                return
+                position_value = (
+                    trade_amount *
+                    leverage_value
+                )
 
-        trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
+                amount = (
+                    position_value /
+                    (price * contract_size)
+                )
 
-        entry_fee = (
-            trade_amount *
-            current_leverage
-        ) * FEE_RATE
+                amount = exchange.amount_to_precision(
+                    symbol,
+                    amount
+                )
 
-        market = exchange.market(symbol)
+                amount_coin = float(amount)
 
-        contract_size = float(
-            market.get("contractSize") or 1
+                if amount_coin <= 0:
+                    raise ValueError(
+                        f"Khối lượng sau làm tròn bằng 0 cho {symbol}"
+                    )
+
+                entry_fee = (
+                    trade_amount *
+                    leverage_value
+                ) * FEE_RATE
+
+                order = exchange.create_order(
+                    symbol=symbol,
+                    type='market',
+                    side=side,
+                    amount=amount_coin,
+                    params={
+                        "tdMode": MARGIN_MODE,
+                        "posSide": "long"
+                        if side == "buy"
+                        else "short"
+                    }
+                )
+
+                # Đồng bộ leverage của toàn bộ lệnh ảo cùng coin,
+                # vì OKX áp leverage theo vị thế cùng symbol/posSide.
+                for existing_pos in self.positions:
+                    if (
+                        existing_pos.get('symbol') == symbol
+                        and existing_pos.get('side') == side
+                    ):
+                        existing_pos['leverage'] = leverage_value
+
+                if leverage_value != preferred_leverage:
+                    send_telegram(
+                        f"⚙️ {symbol} không dùng được x{preferred_leverage}, "
+                        f"đã tự hạ xuống x{leverage_value}"
+                    )
+
+                return (
+                    order,
+                    leverage_value,
+                    amount_coin,
+                    entry_fee
+                )
+
+            except Exception as e:
+                last_error = e
+                error_text = str(e)
+
+                is_leverage_limit_error = (
+                    "51186" in error_text
+                    or "exceeds the platform limit" in error_text
+                    or "leverage" in error_text.lower()
+                    and "limit" in error_text.lower()
+                )
+
+                if is_leverage_limit_error:
+                    print(
+                        f"⚠️ {symbol} không mở được ở x{leverage_value}, "
+                        f"thử leverage thấp hơn..."
+                    )
+                    continue
+
+                raise
+
+        raise RuntimeError(
+            f"Không tìm được leverage phù hợp cho {symbol}: {last_error}"
         )
 
-        position_value = (
-            trade_amount *
-            current_leverage
-        )
 
-        amount = (
-            position_value /
-            (price * contract_size)
-        )
 
-        amount = exchange.amount_to_precision(
-            symbol,
-            amount
-        )
+    def open_position(self, symbol, side, price, vol_diff):
 
-        amount_coin = float(amount)
+        trade_amount = min(self.balance, self.default_trade_amount)
 
         try:
 
-            print(f"symbol={symbol}")
-            print(f"amount={amount_coin}")
-            print(f"price={price}")
-
-            order = exchange.create_order(
+            (
+                order,
+                current_leverage,
+                amount_coin,
+                entry_fee
+            ) = self.create_entry_order_with_leverage_fallback(
                 symbol=symbol,
-                type='market',
                 side=side,
-                amount=amount_coin,
-                params={
-                    "tdMode": MARGIN_MODE,
-                    "posSide": "long"
-                    if side == "buy"
-                    else "short"
-                }
+                price=price,
+                trade_amount=trade_amount,
+                preferred_leverage=LEVERAGE
+            )
+
+            fill_price = self.resolve_order_fill_price(
+                order,
+                symbol,
+                price
             )
 
             self.balance -= entry_fee
 
-            print(f"✅ Đã mở lệnh thật: {symbol}")
+            print(
+                f"✅ Đã mở lệnh thật: {symbol} "
+                f"x{current_leverage}, amount={amount_coin}, fill={fill_price}"
+            )
 
             position_id = self.make_position_id()
 
@@ -999,12 +1151,12 @@ class TradingBot:
                 'symbol': symbol,
                 'side': side,
 
-                'entry_price': price,
-                'first_entry_price': price,
+                'entry_price': fill_price,
+                'first_entry_price': fill_price,
 
                 'amount_coin': amount_coin,
                 'trade_amount': trade_amount,
-                'original_trade_amount': DEFAULT_TRADE_AMOUNT,
+                'original_trade_amount': trade_amount,
                 'entry_fee': entry_fee,
                 'leverage': current_leverage,
 
@@ -1033,7 +1185,9 @@ class TradingBot:
 
         msg = (
             f"{emoji} *VÀO LỆNH {side.upper()} ({symbol})*\n"
-            f"💰 Giá: `{price:,.4f}`\n"
+            f"💰 Giá khớp OKX: `{fill_price:,.8f}`\n"
+            f"🧮 Giá bot dự tính: `{price:,.8f}`\n"
+            f"⚙️ Đòn bẩy thực tế: `x{current_leverage}`\n"
             f"📊 Vol chênh lệch: `+{vol_diff*100:.1f}%` 🔥\n"
             f"💸 Phí mở lệnh: `${entry_fee:.4f}`\n"
             f"💵 Ký quỹ: `${trade_amount:,.2f}`"
@@ -1045,13 +1199,11 @@ class TradingBot:
             self.coins[s]['pending_side'] = None
 
 
-
-
     def execute_dca(self, pos):
 
         symbol = pos['symbol']
 
-        trade_amount = min(self.balance, DEFAULT_TRADE_AMOUNT)
+        trade_amount = min(self.balance, self.default_trade_amount)
 
         dca_number = pos['dca_count'] + 1
 
@@ -1061,48 +1213,23 @@ class TradingBot:
 
             current_price = ticker['last']
 
-            market = exchange.market(symbol)
-
-            contract_size = float(
-                market.get("contractSize") or 1
-            )
-
-            position_value = (
-                trade_amount *
-                pos['leverage']
-            )
-
-            amount = (
-                position_value /
-                (current_price * contract_size)
-            )
-
-            amount = exchange.amount_to_precision(
-                symbol,
-                amount
-            )
-
-            amount_coin = float(amount)
-
-            entry_fee = (
-                trade_amount *
-                pos['leverage']
-            ) * FEE_RATE
-
-            # Mở thêm 1 order cùng chiều, nhưng bot lưu thành 1 vị thế riêng.
-            # Lưu ý: trên OKX cùng symbol + cùng posSide vẫn gộp ngoài sàn,
-            # còn bot sẽ quản lý TP/đóng từng phần bằng reduceOnly.
-            exchange.create_order(
+            (
+                order,
+                actual_leverage,
+                amount_coin,
+                entry_fee
+            ) = self.create_entry_order_with_leverage_fallback(
                 symbol=symbol,
-                type='market',
                 side=pos['side'],
-                amount=amount_coin,
-                params={
-                    "tdMode": MARGIN_MODE,
-                    "posSide": "long"
-                    if pos['side'] == "buy"
-                    else "short"
-                }
+                price=current_price,
+                trade_amount=trade_amount,
+                preferred_leverage=pos.get('leverage', LEVERAGE)
+            )
+
+            fill_price = self.resolve_order_fill_price(
+                order,
+                symbol,
+                current_price
             )
 
             self.balance -= entry_fee
@@ -1116,14 +1243,14 @@ class TradingBot:
                 'symbol': symbol,
                 'side': pos['side'],
 
-                'entry_price': current_price,
-                'first_entry_price': current_price,
+                'entry_price': fill_price,
+                'first_entry_price': fill_price,
 
                 'amount_coin': amount_coin,
                 'trade_amount': trade_amount,
-                'original_trade_amount': DEFAULT_TRADE_AMOUNT,
+                'original_trade_amount': trade_amount,
                 'entry_fee': entry_fee,
-                'leverage': pos['leverage'],
+                'leverage': actual_leverage,
 
                 'dca_count': 0,
                 'waiting_dca': False,
@@ -1138,19 +1265,19 @@ class TradingBot:
                 'rebuild_count': 0
             })
 
+            # Đồng bộ leverage thực tế cho lệnh gốc.
+            pos['leverage'] = actual_leverage
+
             # Lệnh gốc chỉ ghi nhận đã mở DCA lần mấy,
-            # KHÔNG sửa entry_price, KHÔNG cộng trade_amount,
-            # KHÔNG kéo giá trung bình nữa.
+            # KHÔNG sửa entry_price, KHÔNG cộng trade_amount.
             pos['dca_count'] = dca_number
             pos['waiting_dca'] = False
 
-            # DCA riêng đã được tính bằng len(self.positions).
-            # Không trừ current_max_positions nữa, nếu trừ sẽ làm bot bị chặn DCA sớm
-            # và không mở đủ MAX_DCA như mong muốn.
-
             send_telegram(
                 f"📉 Đã mở LỆNH DCA RIÊNG lần {dca_number} cho {symbol}\n"
-                f"💰 Giá DCA: `{current_price}`\n"
+                f"💰 Giá DCA khớp OKX: `{fill_price}`\n"
+                f"🧮 Giá bot dự tính: `{current_price}`\n"
+                f"⚙️ Đòn bẩy thực tế: `x{actual_leverage}`\n"
                 f"💵 Ký quỹ: `${trade_amount:,.2f}`\n"
                 f"📦 Slot lệnh gốc: {self.count_root_positions()}/{self.current_max_positions}\n"
                 f"📌 Tổng lệnh bot đang quản lý: {len(self.positions)}"
@@ -1174,9 +1301,6 @@ class TradingBot:
             send_telegram(
                 f"❌ Lỗi mở lệnh DCA riêng {symbol}:\n`{e}`"
             )
-
-
-
 
     def rebuild_small_loser_position(self, pos):
 
@@ -1423,11 +1547,9 @@ class TradingBot:
             RESTORE_TARGET_TRADE_AMOUNT
         )
 
-        # Không cho phục hồi quá 5$ theo yêu cầu hiện tại.
-        target_trade_amount = min(
-            target_trade_amount,
-            RESTORE_TARGET_TRADE_AMOUNT
-        )
+        # Mỗi lệnh phục hồi đúng về mức vốn lúc chính nó được mở.
+        # Lệnh cũ vẫn giữ mục tiêu cũ; lệnh mới sau lệnh VON sẽ dùng mức mới.
+        target_trade_amount = float(target_trade_amount)
 
         current_trade_amount = pos.get('trade_amount', 0)
 
@@ -1682,7 +1804,7 @@ class TradingBot:
             self.refresh_root_dca_count(root_id)
 
         if symbol and not any(p['symbol'] == symbol for p in self.positions):
-            self.current_max_positions = MAX_POSITIONS
+            self.current_max_positions = self.max_positions
             self.active_dca_symbol = None
             self.bot_paused = False
 
@@ -1831,7 +1953,8 @@ class TradingBot:
             f"📊 *GIÁM SÁT HỆ THỐNG*\n"
             f"{search_status}\n"
             f"🏦 Vốn: `${self.balance:,.2f}$`\n"
-            f"📦 Slot lệnh gốc: `{self.count_root_positions()}/{MAX_POSITIONS}`\n"
+            f"📦 Slot lệnh gốc: `{self.count_root_positions()}/{self.max_positions}`\n"
+            f"💵 Vốn mỗi lệnh mới: `${self.default_trade_amount:g}`\n"
             f"📌 Tổng lệnh bot đang quản lý: `{len(self.positions)}`"
         )
 
