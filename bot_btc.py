@@ -144,6 +144,11 @@ class TradingBot:
         self.rescue_chains = {}
         self.active_rescue_closing = False
 
+        # Khối lượng thật còn trên OKX nhưng bot đã chủ động quên khỏi một lệnh ảo
+        # sau TP khớp một phần hoặc lệnh XR. Khối lượng này không chiếm slot DCA.
+        # Khi lệnh ảo cuối cùng của coin/chiều đóng, bot sẽ đóng luôn toàn bộ phần này.
+        self.ignored_residuals = {}
+
         # Ảnh chụp vị thế gộp thật trên OKX. Không ghi đè giá lệnh riêng của bot.
         self.okx_position_snapshot = {}
         self.sync_blocked_keys = set()
@@ -244,6 +249,9 @@ class TradingBot:
                 elif text.startswith('Đ ') or text.startswith('DONG '):
                     coin_text = text.split(maxsplit=1)[1] if ' ' in text else ''
                     active_bot.close_symbol_by_telegram(coin_text)
+
+                elif text.startswith('XR '):
+                    active_bot.forget_virtual_position_by_telegram(text[3:].strip())
 
                 elif text.startswith('X '):
                     coin_text = text.split(maxsplit=1)[1] if ' ' in text else ''
@@ -408,6 +416,96 @@ class TradingBot:
             f"🧠 Bot restart thì danh sách tự xóa."
         )
 
+    def _remember_ignored_residual(self, pos, amount_coin):
+        """Ghi nhớ khối lượng thật còn trên OKX nhưng không còn chiếm một slot lệnh ảo."""
+        amount_coin = abs(self._safe_float(amount_coin))
+        if amount_coin <= 0:
+            return
+        key = self.get_position_key(pos['symbol'], pos['side'])
+        self.ignored_residuals[key] = self._safe_float(
+            self.ignored_residuals.get(key)
+        ) + amount_coin
+
+    def _clear_ignored_residual(self, key):
+        self.ignored_residuals.pop(key, None)
+
+    def forget_virtual_position_by_telegram(self, text):
+        """XR CRDO DCA1: quên riêng lệnh ảo, không gửi lệnh đóng lên OKX."""
+        parts = (text or '').strip().upper().split()
+        if len(parts) < 2:
+            send_telegram(
+                "⚠️ Cú pháp đúng:\n"
+                "`XR CRDO DCA1`\n"
+                "`XR CRDO DCA2`\n"
+                "`XR CRDO RESCUE1`"
+            )
+            return False
+
+        coin = self.normalize_symbol_query(parts[0])
+        role = ''.join(parts[1:]).replace(' ', '')
+        target = None
+
+        for pos in self.positions:
+            if self.symbol_base_name(pos['symbol']) != coin:
+                continue
+            if role in ('GOC', 'ROOT', 'LENHGOC'):
+                matched = not pos.get('is_dca_position') and not pos.get('is_rescue_position')
+            elif role.startswith('DCA'):
+                try:
+                    number = int(role.replace('DCA', ''))
+                except Exception:
+                    number = -1
+                matched = pos.get('is_dca_position') and int(pos.get('dca_number', -1)) == number
+            elif role.startswith('RESCUE'):
+                try:
+                    number = int(role.replace('RESCUE', ''))
+                except Exception:
+                    number = -1
+                matched = pos.get('is_rescue_position') and int(pos.get('rescue_number', -1)) == number
+            else:
+                matched = False
+
+            if matched:
+                target = pos
+                break
+
+        if target is None:
+            send_telegram(f"🔎 Không tìm thấy `{coin} {role}` trong bộ nhớ bot.")
+            return False
+
+        same_key_positions = [
+            p for p in self.positions
+            if p['symbol'] == target['symbol'] and p['side'] == target['side']
+        ]
+        if len(same_key_positions) <= 1:
+            send_telegram(
+                f"⛔ Không thể XR `{coin} {role}` vì đây là lệnh ảo cuối cùng của coin/chiều.\n"
+                f"📌 Hãy dùng `Đ {coin}` để đóng toàn bộ vị thế thật."
+            )
+            return False
+
+        amount = self._safe_float(target.get('amount_coin'))
+        key = self.get_position_key(target['symbol'], target['side'])
+        self._remember_ignored_residual(target, amount)
+        self.remove_position_from_memory(target)
+
+        # Xóa một mắt xích giữa chuỗi thì dịch các lệnh phía sau xuống ngay:
+        # DCA2 -> DCA1, Rescue1 -> DCA2...
+        if any(
+            p['symbol'] == target['symbol'] and p['side'] == target['side']
+            for p in self.positions
+        ):
+            self._promote_rescue_chain(key)
+
+        send_telegram(
+            f"🧹 *ĐÃ QUÊN LỆNH ẢO KHỎI BOT*\n"
+            f"📍 `{coin} {role}`\n"
+            f"📦 Khối lượng thật còn trên OKX: `{amount}`\n"
+            f"✅ Lệnh này không còn chiếm slot DCA.\n"
+            f"🔒 Bot sẽ cộng phần dư này khi đồng bộ và đóng sạch khi lệnh cuối cùng của coin đóng."
+        )
+        return True
+
     def close_symbol_by_telegram(self, text):
         if self.view_mode:
             send_telegram(
@@ -497,6 +595,8 @@ class TradingBot:
                 self.balance += raw_pnl - exit_fee
                 self.coins[symbol]['last_close_time'] = time.time()
                 self.sync_blocked_keys.discard((symbol, side))
+                self._clear_ignored_residual((symbol, side))
+                self.rescue_chains.pop((symbol, side), None)
 
                 send_telegram(
                     f"✅ *ĐÃ ĐÓNG {coin} BẰNG TELEGRAM*\n"
@@ -1385,12 +1485,12 @@ class TradingBot:
         symbol, side = key
         diff = abs(bot_amount - okx_amount)
         send_telegram(
-            f"⚠️ *LỆCH DỮ LIỆU BOT / OKX*\\n"
-            f"📍 `{symbol}` - `{side.upper()}`\\n"
-            f"🤖 Tổng khối lượng bot: `{bot_amount}`\\n"
-            f"🏦 Tổng khối lượng OKX: `{okx_amount}`\\n"
-            f"📏 Chênh lệch: `{diff}`\\n"
-            f"⏸ Bot tạm khóa TP/DCA riêng coin này để tránh đóng sai.\\n"
+            f"⚠️ *LỆCH DỮ LIỆU BOT / OKX*\n"
+            f"📍 `{symbol}` - `{side.upper()}`\n"
+            f"🤖 Tổng khối lượng bot: `{bot_amount}`\n"
+            f"🏦 Tổng khối lượng OKX: `{okx_amount}`\n"
+            f"📏 Chênh lệch: `{diff}`\n"
+            f"⏸ Bot tạm khóa TP/DCA riêng coin này để tránh đóng sai.\n"
             f"📌 Global TP cũng không chạy cho tới khi khối lượng khớp."
         )
 
@@ -1417,7 +1517,9 @@ class TradingBot:
         new_blocked = set()
 
         for key, group in bot_groups.items():
-            bot_amount = sum(abs(self._safe_float(p.get('amount_coin'))) for p in group)
+            managed_amount = sum(abs(self._safe_float(p.get('amount_coin'))) for p in group)
+            ignored_amount = abs(self._safe_float(self.ignored_residuals.get(key)))
+            bot_amount = managed_amount + ignored_amount
             okx_pos = snapshot.get(key)
             okx_amount = self._safe_float(okx_pos.get('contracts')) if okx_pos else 0.0
 
@@ -1500,7 +1602,7 @@ class TradingBot:
             )
         except Exception as e:
             send_telegram(
-                f"❌ Lỗi GLOBAL TP `{symbol}`:\\n`{e}`"
+                f"❌ Lỗi GLOBAL TP `{symbol}`:\n`{e}`"
             )
             return False
 
@@ -1514,19 +1616,21 @@ class TradingBot:
                 self.positions.remove(pos)
 
         self.sync_blocked_keys.discard(key)
+        self._clear_ignored_residual(key)
+        self.rescue_chains.pop(key, None)
         self.current_max_positions = self.max_positions
         self.active_dca_symbol = None
         self.bot_paused = False
 
         send_telegram(
-            f"🎯 *GLOBAL TP TOÀN COIN*\\n"
-            f"📍 `{symbol}` - `{side.upper()}`\\n"
-            f"📚 Giá trung bình OKX: `{self._safe_float(okx_pos.get('entry_price'))}`\\n"
-            f"📦 Đã đóng toàn bộ `{closed_count}` lệnh bot (gốc + DCA)\\n"
-            f"💵 Tổng ký quỹ bot: `${total_margin:.4f}`\\n"
-            f"📈 PnL gộp OKX: `${gross_pnl:.4f}`\\n"
-            f"💸 Phí vào + phí đóng ước tính: `${total_entry_fees + estimated_exit_fee:.4f}`\\n"
-            f"✅ Lời ròng ước tính: `${net_pnl:.4f}` (`{net_roe:.1f}%` ký quỹ)\\n"
+            f"🎯 *GLOBAL TP TOÀN COIN*\n"
+            f"📍 `{symbol}` - `{side.upper()}`\n"
+            f"📚 Giá trung bình OKX: `{self._safe_float(okx_pos.get('entry_price'))}`\n"
+            f"📦 Đã đóng toàn bộ `{closed_count}` lệnh bot (gốc + DCA)\n"
+            f"💵 Tổng ký quỹ bot: `${total_margin:.4f}`\n"
+            f"📈 PnL gộp OKX: `${gross_pnl:.4f}`\n"
+            f"💸 Phí vào + phí đóng ước tính: `${total_entry_fees + estimated_exit_fee:.4f}`\n"
+            f"✅ Lời ròng ước tính: `${net_pnl:.4f}` (`{net_roe:.1f}%` ký quỹ)\n"
             f"🔄 Coin đã được reset hoàn toàn về DCA0"
         )
 
@@ -1543,9 +1647,9 @@ class TradingBot:
         if now - self.last_loss_bank_notify >= LOSS_BANK_NOTIFY_COOLDOWN:
             self.last_loss_bank_notify = now
             send_telegram(
-                f"🏦 *QUỸ CẮT LỖ ĐƯỢC CỘNG THÊM*\\n"
-                f"💰 Lời vừa đóng: `${tp_profit:.4f}`\\n"
-                f"➕ Trích vào quỹ ({LOSS_CUT_PROFIT_USAGE*100:.0f}%): `${contribution:.4f}`\\n"
+                f"🏦 *QUỸ CẮT LỖ ĐƯỢC CỘNG THÊM*\n"
+                f"💰 Lời vừa đóng: `${tp_profit:.4f}`\n"
+                f"➕ Trích vào quỹ ({LOSS_CUT_PROFIT_USAGE*100:.0f}%): `${contribution:.4f}`\n"
                 f"📊 Số dư quỹ hiện tại: `${self.loss_bank:.4f}`"
             )
 
@@ -2588,44 +2692,134 @@ class TradingBot:
 
     def close_position(self, pos, price, reason):
         symbol = pos['symbol']
+        key = self.get_position_key(symbol, pos['side'])
         close_side = 'sell' if pos['side'] == 'buy' else 'buy'
-        requested_amount = self._safe_float(exchange.amount_to_precision(symbol, pos['amount_coin']))
+
+        same_key_positions = [
+            p for p in self.positions
+            if p['symbol'] == symbol and p['side'] == pos['side']
+        ]
+        is_last_managed_position = len(same_key_positions) == 1 and same_key_positions[0] is pos
+
+        # Lệnh ảo cuối cùng phải dọn toàn bộ vị thế thật trên OKX,
+        # gồm cả các phần dư mà bot đã quên sau partial fill/XR.
+        requested_amount = self._safe_float(
+            exchange.amount_to_precision(symbol, pos['amount_coin'])
+        )
+        if is_last_managed_position:
+            snapshot = self.fetch_okx_position_snapshot()
+            okx_pos = snapshot.get(key) if snapshot else None
+            actual_amount = abs(self._safe_float(okx_pos.get('contracts'))) if okx_pos else 0.0
+            if actual_amount > 0:
+                requested_amount = self._safe_float(
+                    exchange.amount_to_precision(symbol, actual_amount)
+                )
+
+        if requested_amount <= 0:
+            self.remove_position_from_memory(pos)
+            if is_last_managed_position:
+                self._clear_ignored_residual(key)
+            return 0.0
+
         try:
+            original_virtual_amount = max(
+                self._safe_float(pos.get('amount_coin')),
+                1e-12
+            )
             clid = self.make_client_order_id('TP', pos.get('position_id'))
             order = exchange.create_market_order(symbol, close_side, requested_amount, params={
-                'tdMode': MARGIN_MODE, 'reduceOnly': True,
+                'tdMode': MARGIN_MODE,
+                'reduceOnly': True,
                 'posSide': 'long' if pos['side'] == 'buy' else 'short',
                 'clOrdId': clid,
             })
             fill = self.resolve_order_fill(order, symbol, price, requested_amount)
-            fill_amount = min(fill['amount'] or requested_amount, pos['amount_coin'])
-            fill_price = fill['price'] or price
-            raw_pnl = self.calculate_realized_pnl_from_fill(pos, fill_price, fill_amount)
-            exit_fee = fill['fee'] if fill['fee'] > 0 else pos['trade_amount'] * pos['leverage'] * FEE_RATE
-            allocated_entry_fee = pos['entry_fee'] * (fill_amount / pos['amount_coin'])
+            fill_amount = min(
+                self._safe_float(fill.get('amount'), requested_amount),
+                requested_amount
+            )
+            fill_price = self._safe_float(fill.get('price'), price)
+
+            # Phần lời/lỗ trả về chỉ tính trên phần thuộc lệnh ảo này.
+            virtual_filled_amount = min(fill_amount, original_virtual_amount)
+            raw_pnl = self.calculate_realized_pnl_from_fill(
+                pos, fill_price, virtual_filled_amount
+            )
+            exit_fee = self._safe_float(fill.get('fee'))
+            if exit_fee <= 0:
+                market = exchange.market(symbol)
+                contract_size = self._safe_float(market.get('contractSize'), 1.0)
+                exit_fee = fill_amount * fill_price * contract_size * FEE_RATE
+
+            virtual_ratio = min(1.0, virtual_filled_amount / original_virtual_amount)
+            allocated_entry_fee = self._safe_float(pos.get('entry_fee')) * virtual_ratio
             real_net_profit = raw_pnl - allocated_entry_fee - exit_fee
-            self.add_fill_event(pos, 'CLOSE', fill, -pos['trade_amount'], reason)
+
+            self.add_fill_event(pos, 'CLOSE', fill, -self._safe_float(pos.get('trade_amount')), reason)
             self.balance += raw_pnl - exit_fee
             self.coins[symbol]['last_close_time'] = time.time()
-            send_telegram(
-                f"✅ *ĐÓNG LỆNH {symbol} THEO FILL OKX*\n📝 {reason}\n"
-                f"💰 Giá đóng khớp: `{fill_price}`\n📦 Khối lượng khớp: `{fill_amount}`\n"
-                f"💸 Phí đóng OKX/ước tính: `${exit_fee:.6f}`\n"
-                f"💰 Lời/lỗ ròng: `${real_net_profit:.4f}`"
-            )
-            # Market order thông thường phải khớp đủ; nếu thiếu thì giữ phần còn lại trong bot.
-            if fill_amount + 1e-12 < pos['amount_coin']:
-                ratio = fill_amount / pos['amount_coin']
-                pos['amount_coin'] -= fill_amount
-                pos['trade_amount'] *= 1 - ratio
-                pos['entry_fee'] *= 1 - ratio
-                send_telegram(f"⚠️ `{symbol}` chỉ khớp một phần, bot giữ lại `{pos['amount_coin']}`")
-            else:
+
+            # Nếu đây là lệnh cuối cùng, kiểm tra và đóng nốt toàn bộ phần thật còn lại.
+            extra_closed = 0.0
+            if is_last_managed_position:
+                for _ in range(2):
+                    snapshot = self.fetch_okx_position_snapshot()
+                    okx_pos = snapshot.get(key) if snapshot else None
+                    remaining_actual = abs(
+                        self._safe_float(okx_pos.get('contracts'))
+                    ) if okx_pos else 0.0
+                    remaining_actual = self._safe_float(
+                        exchange.amount_to_precision(symbol, remaining_actual)
+                    )
+                    if remaining_actual <= 0:
+                        break
+                    extra_order = exchange.create_market_order(
+                        symbol,
+                        close_side,
+                        remaining_actual,
+                        params={
+                            'tdMode': MARGIN_MODE,
+                            'reduceOnly': True,
+                            'posSide': 'long' if pos['side'] == 'buy' else 'short',
+                            'clOrdId': self.make_client_order_id('TPCLEAN', pos.get('position_id')),
+                        }
+                    )
+                    extra_fill = self.resolve_order_fill(
+                        extra_order, symbol, fill_price, remaining_actual
+                    )
+                    extra_closed += self._safe_float(
+                        extra_fill.get('amount'), remaining_actual
+                    )
+
                 self.remove_position_from_memory(pos)
+                self._clear_ignored_residual(key)
+                self.rescue_chains.pop(key, None)
+            else:
+                # TP khớp một phần hay đủ đều quên hẳn lệnh ảo để giải phóng slot.
+                # Phần chưa khớp vẫn nằm trên OKX và được ghi vào ignored_residuals.
+                remaining_virtual = max(
+                    0.0, original_virtual_amount - virtual_filled_amount
+                )
+                if remaining_virtual > 0:
+                    self._remember_ignored_residual(pos, remaining_virtual)
+                self.remove_position_from_memory(pos)
+
+            send_telegram(
+                f"✅ *ĐÓNG LỆNH {symbol} THEO FILL OKX*\n"
+                f"📝 {reason}\n"
+                f"💰 Giá đóng khớp: `{fill_price}`\n"
+                f"📦 Khối lượng khớp lần đầu: `{fill_amount}/{requested_amount}`\n"
+                f"🧹 Khối lượng đóng bổ sung cuối coin: `{extra_closed}`\n"
+                f"💸 Phí đóng OKX/ước tính: `${exit_fee:.6f}`\n"
+                f"💰 Lời/lỗ ròng lệnh ảo: `${real_net_profit:.4f}`\n"
+                f"✅ Slot lệnh ảo đã được giải phóng"
+            )
             return real_net_profit
+
         except Exception as e:
             send_telegram(f"❌ Lỗi đóng lệnh thật {symbol}:\n`{e}`")
             return 0
+
 
     def send_multi_report(self):
 
