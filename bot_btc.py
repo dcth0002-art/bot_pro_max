@@ -4,6 +4,7 @@ import os
 import telebot
 from dotenv import load_dotenv
 from collections import deque
+from functools import wraps
 import numpy as np
 import traceback
 import threading
@@ -18,7 +19,8 @@ DEFAULT_TRADE_AMOUNT = 10 # vốn vào lệnh
 INITIAL_BALANCE = 500 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
-VOL_WINDOW_SIZE = 1000 # thời gian tính volume
+VOL_WINDOW_SIZE = 1000 # cửa sổ tính volume theo chiến lược gốc
+OHLCV_CACHE_SECONDS = 30 # nến 1h không cần tải lại cho mỗi lần đọc giá
 COOLDOWN_PERIOD = 11 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
 CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
@@ -120,6 +122,14 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 ACTIVE_TRADING_BOT = None
 TELEGRAM_POLLING_STARTED = False
 
+def synchronized_trading(method):
+    """Không cho Telegram và vòng quản lý chính gửi order chồng lên nhau."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.trading_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
 def send_telegram(message):
     print(message)
     if bot and TELEGRAM_CHAT_ID:
@@ -133,6 +143,7 @@ class TradingBot:
         self.balance = INITIAL_BALANCE
         self.positions = []
         self.next_position_id = 1
+        self.trading_lock = threading.RLock()
         # Cấu hình runtime có thể đổi qua Telegram.
         self.default_trade_amount = float(DEFAULT_TRADE_AMOUNT)
         self.max_positions = int(MAX_POSITIONS)
@@ -162,13 +173,18 @@ class TradingBot:
         self.active_dca_symbol = None
         self.bot_paused = False
         self.test_order_running = False
+        self.recovery_session = None
+        self.startup_position_check_done = False
         
         self.coins = {}
         for symbol in SYMBOLS:
             self.coins[symbol] = {
                 'vol_trades': deque(),
                 'last_trade_id': None,
+                'last_trade_timestamp': None,
                 'price_history': deque(maxlen=310),
+                'last_ohlcv_fetch_time': 0.0,
+                'last_market_price': 0.0,
                 'pending_side': None,
                 'trigger_price': 0,
                 'trigger_time': 0,
@@ -238,6 +254,15 @@ class TradingBot:
 
                 elif text in ('CĐ CHẠY', 'CĐ CHAY', 'CD CHẠY', 'CD CHAY'):
                     active_bot.disable_view_mode()
+
+                elif text in ('KHOI PHUC', 'KHÔI PHỤC'):
+                    active_bot.start_okx_recovery()
+
+                elif text in ('HUY KHOI PHUC', 'HỦY KHÔI PHỤC'):
+                    active_bot.cancel_okx_recovery()
+
+                elif active_bot.recovery_session is not None:
+                    active_bot.handle_okx_recovery_answer(text)
 
                 elif text == 'TEST':
                     threading.Thread(
@@ -356,6 +381,372 @@ class TradingBot:
     def symbol_base_name(self, symbol):
         return symbol.split('/')[0].upper()
 
+    def _recovery_role_name(self, index):
+        if index == 0:
+            return 'LỆNH GỐC'
+        return f'DCA{index}'
+
+    def guard_unmanaged_okx_positions_on_startup(self):
+        """Không săn lệnh mới nếu OKX đã có vị thế nhưng RAM bot đang trống."""
+        if self.startup_position_check_done:
+            return True
+        try:
+            raw_positions = exchange.fetch_positions()
+        except Exception as e:
+            self.view_mode = True
+            self.search_paused = True
+            send_telegram(
+                f"⚠️ Không kiểm tra được vị thế OKX lúc khởi động:\n`{e}`\n"
+                "👁 Bot tự khóa ở CHẾ ĐỘ XEM. Hãy kiểm tra kết nối rồi nhắn `KHOI PHUC`."
+            )
+            return False
+
+        self.startup_position_check_done = True
+        active = [
+            item for item in (raw_positions or [])
+            if abs(self._safe_float(item.get('contracts'))) > OKX_SYNC_ABS_TOLERANCE
+        ]
+        if active and not self.positions:
+            self.view_mode = True
+            self.search_paused = True
+            send_telegram(
+                "🛡 *PHÁT HIỆN VỊ THẾ OKX KHI BOT VỪA KHỞI ĐỘNG*\n"
+                f"📦 Có `{len(active)}` vị thế coin/chiều nhưng bộ nhớ lệnh riêng đang trống.\n"
+                "👁 Bot đã tự khóa ở CHẾ ĐỘ XEM và không săn lệnh mới.\n"
+                "➡️ Nhắn `KHOI PHUC` để dựng lại LỆNH GỐC/DCA."
+            )
+        return True
+
+    def _send_next_recovery_question(self):
+        session = self.recovery_session
+        if not session:
+            return
+        groups = session['groups']
+        group_index = session['group_index']
+        if group_index >= len(groups):
+            self._finish_okx_recovery()
+            return
+
+        group = groups[group_index]
+        price_index = len(group['entry_prices'])
+        if price_index >= group['slice_count']:
+            session['group_index'] += 1
+            self._send_next_recovery_question()
+            return
+
+        role = self._recovery_role_name(price_index)
+        send_telegram(
+            "🧩 *KHÔI PHỤC GIÁ VÀO RIÊNG*\n"
+            f"📍 `{group['symbol']}` - `{group['side'].upper()}`\n"
+            f"🏦 Giá trung bình OKX: `{group['okx_entry_price']}`\n"
+            f"📦 Tổng contract OKX: `{group['contracts']}`\n"
+            f"💵 Ký quỹ ước tính: `${group['estimated_margin']:.4f}`\n"
+            f"🧱 Bot nhận diện: `{group['slice_count']}` lệnh riêng\n\n"
+            f"➡️ Hãy gửi *GIÁ VÀO CỦA {role}* dưới dạng số.\n"
+            "Ví dụ: `0.012345`\n"
+            "Hủy toàn bộ bằng: `HUY KHOI PHUC`"
+        )
+
+    @synchronized_trading
+    def start_okx_recovery(self):
+        if self.recovery_session is not None:
+            send_telegram(
+                "⏳ Một phiên `KHOI PHUC` đang chờ nhập giá. "
+                "Tiếp tục trả lời hoặc nhắn `HUY KHOI PHUC`."
+            )
+            return False
+        if self.positions:
+            send_telegram(
+                "⛔ Bot đang có dữ liệu lệnh riêng trong bộ nhớ nên không được khôi phục chồng lên.\n"
+                "📌 Chỉ dùng `KHOI PHUC` ngay sau khi bot mới khởi động và bộ nhớ đang trống."
+            )
+            return False
+
+        # Khôi phục luôn bắt đầu ở chế độ chỉ xem. Không order nào được phép chạy
+        # cho đến khi người dùng kiểm tra xong và chủ động nhắn CĐ CHẠY.
+        self.view_mode = True
+        self.search_paused = True
+        try:
+            raw_positions = exchange.fetch_positions()
+        except Exception as e:
+            send_telegram(
+                f"❌ Không đọc được vị thế OKX để khôi phục:\n`{e}`\n"
+                "✅ Bot vẫn ở CHẾ ĐỘ XEM; chưa tạo dữ liệu lệnh nào."
+            )
+            return False
+
+        groups = []
+        unsupported = []
+        for item in raw_positions or []:
+            symbol = item.get('symbol')
+            side = self._okx_side_from_position(item)
+            contracts = abs(self._safe_float(item.get('contracts')))
+            if not symbol or side is None or contracts <= OKX_SYNC_ABS_TOLERANCE:
+                continue
+            market = markets.get(symbol) or {}
+            if not market.get('swap') or market.get('quote') != 'USDT':
+                continue
+
+            info = item.get('info') or {}
+            leverage = self._safe_float(
+                item.get('leverage'),
+                self._safe_float(info.get('lever'), LEVERAGE)
+            )
+            if leverage <= 0:
+                leverage = LEVERAGE
+            entry_price = self._safe_float(
+                item.get('entryPrice'),
+                self._safe_float(info.get('avgPx'))
+            )
+            mark_price = self._safe_float(
+                item.get('markPrice'),
+                self._safe_float(info.get('markPx'), entry_price)
+            )
+            contract_size = self._safe_float(market.get('contractSize'), 1.0)
+            # Đếm lát theo notional tại giá vào để biến động mark price không làm
+            # một lệnh 10$ bị nhận nhầm thành 2 lệnh.
+            entry_notional = contracts * entry_price * contract_size
+            estimated_margin = entry_notional / leverage if leverage > 0 else 0.0
+            if estimated_margin <= 0:
+                notional = abs(self._safe_float(
+                    item.get('notional'),
+                    self._safe_float(info.get('notionalUsd'))
+                ))
+                estimated_margin = notional / leverage if leverage > 0 else 0.0
+            if estimated_margin <= 0:
+                estimated_margin = abs(self._safe_float(
+                    item.get('initialMargin'), self._safe_float(info.get('margin'))
+                ))
+
+            # Làm tròn theo lệnh chuẩn: 0-14.99$ => 1 lệnh, 15-24.99$ => 2...
+            standard_margin = max(0.01, self._safe_float(self.default_trade_amount, DEFAULT_TRADE_AMOUNT))
+            slice_count = max(1, int((estimated_margin / standard_margin) + 0.5))
+            if slice_count > MAX_DCA + 1:
+                unsupported.append(
+                    f"`{symbol}` `{side.upper()}` ≈ `{slice_count}` lệnh "
+                    "(có thể đã vào Rescue/cắt/bơm)"
+                )
+                continue
+
+            groups.append({
+                'symbol': symbol,
+                'side': side,
+                'contracts': contracts,
+                'leverage': leverage,
+                'okx_entry_price': entry_price,
+                'mark_price': mark_price,
+                'estimated_margin': estimated_margin,
+                'slice_count': slice_count,
+                'entry_prices': [],
+            })
+
+        if unsupported:
+            send_telegram(
+                "⛔ *CHƯA THỂ KHÔI PHỤC AN TOÀN*\n"
+                "Các vị thế sau vượt quá LỆNH GỐC + DCA1 + DCA2:\n"
+                + "\n".join(unsupported)
+                + "\n📌 Bot không đoán Rescue vì cần thêm carried_loss và lịch sử cắt nguồn."
+            )
+            return False
+        if not groups:
+            send_telegram(
+                "ℹ️ OKX không có vị thế swap USDT nào để khôi phục.\n"
+                "👁 Bot vẫn đang ở CHẾ ĐỘ XEM."
+            )
+            return False
+
+        # Vị thế chỉ có một lệnh có thể dùng trực tiếp giá trung bình OKX.
+        for group in groups:
+            if group['slice_count'] == 1:
+                if group['okx_entry_price'] <= 0:
+                    send_telegram(
+                        f"⛔ `{group['symbol']}` không có giá trung bình OKX hợp lệ."
+                    )
+                    return False
+                group['entry_prices'].append(group['okx_entry_price'])
+
+        self.recovery_session = {
+            'groups': groups,
+            'group_index': 0,
+            'started_at': time.time(),
+        }
+        send_telegram(
+            "🔎 *BẮT ĐẦU KHÔI PHỤC TỪ OKX*\n"
+            f"📦 Phát hiện `{len(groups)}` vị thế coin/chiều.\n"
+            "👁 Bot đã khóa ở CHẾ ĐỘ XEM và chưa gửi bất kỳ order nào."
+        )
+        self._send_next_recovery_question()
+        return True
+
+    @synchronized_trading
+    def handle_okx_recovery_answer(self, text):
+        session = self.recovery_session
+        if session is None:
+            return False
+        try:
+            price = float(str(text).strip().replace(',', '.'))
+            if price <= 0:
+                raise ValueError
+        except Exception:
+            send_telegram(
+                "⚠️ Giá không hợp lệ. Chỉ gửi một số dương, ví dụ: `0.012345`.\n"
+                "Hủy bằng: `HUY KHOI PHUC`"
+            )
+            return False
+
+        group = session['groups'][session['group_index']]
+        group['entry_prices'].append(price)
+        send_telegram(
+            f"✅ Đã ghi giá `{self._recovery_role_name(len(group['entry_prices']) - 1)}` "
+            f"của `{group['symbol']}`: `{price}`"
+        )
+        if len(group['entry_prices']) >= group['slice_count']:
+            session['group_index'] += 1
+        self._send_next_recovery_question()
+        return True
+
+    @synchronized_trading
+    def cancel_okx_recovery(self):
+        if self.recovery_session is None:
+            send_telegram("ℹ️ Không có phiên khôi phục nào đang chạy.")
+            return False
+        self.recovery_session = None
+        send_telegram(
+            "🛑 Đã hủy khôi phục. Không có dữ liệu lệnh nào được tạo.\n"
+            "👁 Bot vẫn ở CHẾ ĐỘ XEM."
+        )
+        return True
+
+    def _finish_okx_recovery(self):
+        session = self.recovery_session
+        if not session:
+            return False
+
+        recovered = []
+        try:
+            for group in session['groups']:
+                prices = group['entry_prices']
+                if len(prices) != group['slice_count'] or any(p <= 0 for p in prices):
+                    raise RuntimeError(f"Thiếu giá vào cho {group['symbol']}")
+
+                market = exchange.market(group['symbol'])
+                contract_size = self._safe_float(market.get('contractSize'), 1.0)
+                leverage = group['leverage']
+                # Mỗi lát bắt đầu với cùng vốn chuẩn. Scale contract để tổng cuối
+                # khớp tuyệt đối với vị thế thật OKX.
+                raw_weights = [
+                    (self.default_trade_amount * leverage) / (price * contract_size)
+                    for price in prices
+                ]
+                weight_total = sum(raw_weights)
+                if weight_total <= 0:
+                    raise RuntimeError(f"Không phân bổ được contract cho {group['symbol']}")
+                amounts = [
+                    group['contracts'] * weight / weight_total
+                    for weight in raw_weights
+                ]
+                recovered_avg = (
+                    sum(price * amount for price, amount in zip(prices, amounts))
+                    / group['contracts']
+                )
+                okx_avg = group['okx_entry_price']
+                if okx_avg > 0:
+                    avg_error = abs(recovered_avg - okx_avg) / okx_avg
+                    if avg_error > OKX_SYNC_REL_TOLERANCE:
+                        raise RuntimeError(
+                            f"Giá đã nhập cho {group['symbol']} tạo giá gộp "
+                            f"{recovered_avg}, lệch quá {OKX_SYNC_REL_TOLERANCE*100:.0f}% "
+                            f"so với OKX {okx_avg}. Hãy KHOI PHUC lại và kiểm tra giá."
+                        )
+
+                root_id = self.make_position_id()
+                root_price = prices[0]
+                for index, (price, amount) in enumerate(zip(prices, amounts)):
+                    amount = self._safe_float(amount)
+                    trade_amount = self.margin_from_fill(
+                        group['symbol'], amount, price, leverage,
+                        self.default_trade_amount
+                    )
+                    entry_fee = trade_amount * leverage * FEE_RATE
+                    position_id = root_id if index == 0 else self.make_position_id()
+                    pos = {
+                        'position_id': position_id,
+                        'root_id': root_id,
+                        'symbol': group['symbol'],
+                        'side': group['side'],
+                        'entry_price': price,
+                        'first_entry_price': root_price if index == 0 else price,
+                        'amount_coin': amount,
+                        'trade_amount': trade_amount,
+                        'original_trade_amount': trade_amount,
+                        'entry_fee': entry_fee,
+                        'leverage': leverage,
+                        'dca_count': group['slice_count'] - 1 if index == 0 else 0,
+                        'waiting_dca': False,
+                        'is_dca_position': index > 0,
+                        'is_rescue_position': False,
+                        'chain_order': index,
+                        'tp_trailing_active': False,
+                        'tp_peak_pnl': 0,
+                        'tp_trailing_stop_pnl': 0,
+                        'rebuild_count': 0,
+                        'fills': [],
+                        'recovered_from_okx': True,
+                    }
+                    if index > 0:
+                        pos['dca_number'] = index
+                        pos['parent_entry_price'] = root_price
+                    recovered.append(pos)
+
+            for group in session['groups']:
+                recovered_amount = sum(
+                    self._safe_float(p.get('amount_coin'))
+                    for p in recovered
+                    if p['symbol'] == group['symbol'] and p['side'] == group['side']
+                )
+                tolerance = max(
+                    OKX_SYNC_ABS_TOLERANCE,
+                    group['contracts'] * OKX_SYNC_REL_TOLERANCE
+                )
+                if abs(recovered_amount - group['contracts']) > tolerance:
+                    raise RuntimeError(
+                        f"Tổng contract khôi phục lệch OKX cho {group['symbol']}: "
+                        f"{recovered_amount} != {group['contracts']}"
+                    )
+
+            self.positions.extend(recovered)
+            self.recovery_session = None
+            # CĐ CHẠY sau khi người dùng kiểm tra sẽ tiếp tục cả quản lý lệnh
+            # lẫn săn tín hiệu mới, trừ khi họ chủ động nhắn D sau đó.
+            self.search_paused = False
+            self.refresh_bot_paused_state()
+            lines = [
+                "✅ *KHÔI PHỤC HOÀN TẤT TRONG CHẾ ĐỘ XEM*",
+                f"📚 Đã dựng lại `{len(recovered)}` lệnh riêng.",
+            ]
+            for group in session['groups']:
+                labels = ", ".join(
+                    f"{self._recovery_role_name(i)}=`{price}`"
+                    for i, price in enumerate(group['entry_prices'])
+                )
+                lines.append(
+                    f"📍 `{group['symbol']}` `{group['side'].upper()}`: {labels}"
+                )
+            lines.extend([
+                "👁 Bot vẫn chưa được phép đặt/đóng order.",
+                "📌 Hãy nhắn tên từng coin để kiểm tra.",
+                "▶️ Chỉ khi mọi thứ đúng mới nhắn: `CĐ CHẠY`",
+            ])
+            send_telegram("\n".join(lines)[:3900])
+            return True
+        except Exception as e:
+            self.recovery_session = None
+            send_telegram(
+                f"❌ Khôi phục thất bại:\n`{e}`\n"
+                "✅ Chưa thêm dữ liệu lệnh nào; bot vẫn ở CHẾ ĐỘ XEM."
+            )
+            return False
+
     def is_symbol_blacklisted(self, symbol):
         return self.symbol_base_name(symbol) in self.blacklist
 
@@ -440,6 +831,7 @@ class TradingBot:
     def _clear_ignored_residual(self, key):
         self.ignored_residuals.pop(key, None)
 
+    @synchronized_trading
     def forget_virtual_position_by_telegram(self, text):
         """XR CRDO DCA1: quên riêng lệnh ảo, không gửi lệnh đóng lên OKX."""
         parts = (text or '').strip().upper().split()
@@ -546,6 +938,7 @@ class TradingBot:
                 return symbol
         return None
 
+    @synchronized_trading
     def run_real_tp_test(self):
         """Mở BTC thật rồi gọi đúng close_position như thể lệnh vừa đạt TP."""
         if self.test_order_running:
@@ -611,6 +1004,9 @@ class TradingBot:
             fill = self.resolve_order_fill(order, symbol, open_price, requested_amount)
             fill_price = self._safe_float(fill.get('price'), open_price)
             amount_coin = self._safe_float(fill.get('amount'), requested_amount)
+            trade_amount = self.margin_from_fill(
+                symbol, amount_coin, fill_price, actual_leverage, trade_amount
+            )
             entry_fee = self._safe_float(fill.get('fee'))
             if entry_fee <= 0:
                 entry_fee = self._safe_float(estimated_fee)
@@ -715,6 +1111,7 @@ class TradingBot:
         finally:
             self.test_order_running = False
 
+    @synchronized_trading
     def close_symbol_by_telegram(self, text):
         if self.view_mode:
             send_telegram(
@@ -746,7 +1143,25 @@ class TradingBot:
 
         all_ok = True
         for (symbol, side), group in list(groups.items()):
-            total_amount = sum(max(0.0, self._safe_float(p.get('amount_coin'))) for p in group)
+            snapshot = self.fetch_okx_position_snapshot_for_symbols([symbol])
+            if snapshot is None:
+                send_telegram(
+                    f"❌ Không xác minh được vị thế OKX của `{symbol}`; "
+                    "bot không đóng và không xóa dữ liệu lệnh."
+                )
+                all_ok = False
+                continue
+            okx_pos = snapshot.get((symbol, side)) if snapshot else None
+            total_amount = (
+                abs(self._safe_float(okx_pos.get('contracts')))
+                if okx_pos else 0.0
+            )
+            if total_amount <= OKX_SYNC_ABS_TOLERANCE:
+                self.forget_stale_group_when_okx_empty(
+                    (symbol, side), group,
+                    "Lệnh đóng Telegram kiểm tra và thấy OKX đã hết vị thế."
+                )
+                continue
             requested_amount = self._safe_float(exchange.amount_to_precision(symbol, total_amount))
             if requested_amount <= 0:
                 send_telegram(f"❌ `{symbol}` có khối lượng đóng bằng 0 sau khi làm tròn.")
@@ -778,6 +1193,8 @@ class TradingBot:
                     contract_size = self._safe_float(market.get('contractSize'), 1.0)
                     exit_fee = fill_amount * fill_price * contract_size * FEE_RATE
 
+                # Nếu OKX chỉ khớp một phần tổng vị thế (kể cả residual), giữ lại
+                # một phần dữ liệu ảo để bot không bỏ quên khối lượng còn trên sàn.
                 close_ratio = min(1.0, fill_amount / total_amount) if total_amount > 0 else 0.0
                 raw_pnl = 0.0
                 allocated_entry_fee = 0.0
@@ -803,8 +1220,9 @@ class TradingBot:
                 net_pnl = raw_pnl - allocated_entry_fee - exit_fee
                 self.balance += raw_pnl - exit_fee
                 self.coins[symbol]['last_close_time'] = time.time()
-                self._clear_ignored_residual((symbol, side))
-                self.rescue_chains.pop((symbol, side), None)
+                if fill_amount + OKX_SYNC_ABS_TOLERANCE >= total_amount:
+                    self._clear_ignored_residual((symbol, side))
+                    self.rescue_chains.pop((symbol, side), None)
 
                 send_telegram(
                     f"✅ *ĐÃ ĐÓNG {coin} BẰNG TELEGRAM*\n"
@@ -815,7 +1233,7 @@ class TradingBot:
                     f"💰 Lời/lỗ ròng ước tính: `${net_pnl:.4f}`"
                 )
 
-                if close_ratio < 0.999999:
+                if fill_amount + OKX_SYNC_ABS_TOLERANCE < total_amount:
                     all_ok = False
                     send_telegram(
                         f"⚠️ `{symbol}` chỉ khớp một phần. Bot giữ lại phần khối lượng chưa đóng để tiếp tục quản lý."
@@ -829,6 +1247,7 @@ class TradingBot:
             send_telegram(f"🔄 `{coin}` đã đóng toàn bộ và reset khỏi bộ nhớ bot.")
         return all_ok
 
+    @synchronized_trading
     def enable_view_mode(self):
         if self.view_mode:
             send_telegram(
@@ -860,7 +1279,14 @@ class TradingBot:
             "▶️ Bật lại bằng: `CĐ CHẠY`"
         )
 
+    @synchronized_trading
     def disable_view_mode(self):
+        if self.recovery_session is not None:
+            send_telegram(
+                "⛔ Chưa thể bật CHẾ ĐỘ CHẠY vì `KHOI PHUC` chưa nhập xong.\n"
+                "📌 Hãy trả lời đủ giá hoặc nhắn `HUY KHOI PHUC`."
+            )
+            return
         if not self.view_mode:
             send_telegram("ℹ️ Bot hiện không ở chế độ xem.")
             return
@@ -1018,10 +1444,27 @@ class TradingBot:
         if not root_pos:
             return
 
+        active_dcas = sorted(
+            [
+                p
+                for p in self.positions
+                if p.get('root_id') == root_id and p.get('is_dca_position')
+            ],
+            key=lambda p: (
+                int(p.get('dca_number', 0)),
+                int(p.get('position_id', 0))
+            )
+        )
+
+        # Không để hổng cấp DCA: nếu DCA1 đóng trong lúc DCA2 còn tồn tại,
+        # DCA2 được đổi vai trò thành DCA1 và cấp tiếp theo vẫn có thể mở lại.
+        for number, dca_pos in enumerate(active_dcas, start=1):
+            dca_pos['dca_number'] = number
+            dca_pos['chain_order'] = number
+
         active_dca_numbers = [
             p.get('dca_number', 0)
-            for p in self.positions
-            if p.get('root_id') == root_id and p.get('is_dca_position')
+            for p in active_dcas
         ]
 
         new_dca_count = max(active_dca_numbers) if active_dca_numbers else 0
@@ -1041,7 +1484,11 @@ class TradingBot:
         try:
             c = self.coins[symbol]
             current_time = time.time()
-            trades = exchange.fetch_trades(symbol, limit=50) 
+            since = (
+                int(c['last_trade_timestamp']) + 1
+                if c.get('last_trade_timestamp') is not None else None
+            )
+            trades = exchange.fetch_trades(symbol, since=since, limit=100)
             new_trades = []
             if c['last_trade_id'] is None:
                 new_trades = trades
@@ -1054,6 +1501,7 @@ class TradingBot:
                 for t in new_trades:
                     c['vol_trades'].append((t['timestamp'] / 1000, t['side'], t['amount']))
                 c['last_trade_id'] = new_trades[-1]['id']
+                c['last_trade_timestamp'] = new_trades[-1]['timestamp']
 
             cutoff = current_time - VOL_WINDOW_SIZE
             while c['vol_trades'] and c['vol_trades'][0][0] < cutoff:
@@ -1062,15 +1510,24 @@ class TradingBot:
             c['total_buy_30p'] = sum(t[2] for t in c['vol_trades'] if t[1] == 'buy')
             c['total_sell_30p'] = sum(t[2] for t in c['vol_trades'] if t[1] == 'sell')
 
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
-            closes = [x[4] for x in ohlcv]
-            c['price_history'].clear()
-            c['price_history'].extend(closes)
-            current_price = closes[-1]
-            last_candle = ohlcv[-1]
-            c['last_candle_time'] = last_candle[0]
-            c['last_open'] = last_candle[1]
-            c['last_close'] = last_candle[4]
+            if (
+                not c['price_history']
+                or current_time - c.get('last_ohlcv_fetch_time', 0.0) >= OHLCV_CACHE_SECONDS
+            ):
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
+                if not ohlcv:
+                    return None
+                closes = [x[4] for x in ohlcv]
+                c['price_history'].clear()
+                c['price_history'].extend(closes)
+                last_candle = ohlcv[-1]
+                c['last_candle_time'] = last_candle[0]
+                c['last_open'] = last_candle[1]
+                c['last_close'] = last_candle[4]
+                c['last_ohlcv_fetch_time'] = current_time
+
+            # Giữ nguyên chiến lược gốc: dùng giá đóng của nến 1h hiện tại.
+            current_price = self._safe_float(c['price_history'][-1])
             return current_price
 
 
@@ -1269,6 +1726,7 @@ class TradingBot:
 
     def run(self):
         send_telegram(f"🚀 *Bé nhà đã dậy*\n- đang nạp dữ liệu")
+        self.guard_unmanaged_okx_positions_on_startup()
         
         while True:
 
@@ -1286,11 +1744,6 @@ class TradingBot:
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            if self.bot_paused:
-
-                time.sleep(10)
-
-                continue
             if not self.is_warmed_up:
                 if current_time - self.start_time >= WARMUP_PERIOD:
                     self.is_warmed_up = True
@@ -1306,7 +1759,11 @@ class TradingBot:
             # --- TRƯỜNG HỢP 1: ĐI SĂN TÍN HIỆU ---
             # Chỉ slot lệnh gốc mới giới hạn tìm lệnh mới.
             # Lệnh DCA riêng không tính vào slot này.
-            if (not self.search_paused) and self.count_root_positions() < self.current_max_positions:
+            if (
+                not self.bot_paused
+                and not self.search_paused
+                and self.count_root_positions() < self.current_max_positions
+            ):
                 for symbol in SYMBOLS:
                     if self.is_symbol_blacklisted(symbol):
                         continue
@@ -1320,19 +1777,21 @@ class TradingBot:
                     if len(c['price_history']) < 3:
                         continue
 
-                    price_3p_ago = c['price_history'][-3]
+                    # price_history dùng nến 1h: đây là giá của 3 mẫu nến gần nhất,
+                    # không phải giá 3 phút trước.
+                    price_3_candles_ago = c['price_history'][-3]
                     buy_diff = (c['total_buy_30p'] - c['total_sell_30p']) / c['total_sell_30p'] if c['total_sell_30p'] > 0 else 1.0
                     sell_diff = (c['total_sell_30p'] - c['total_buy_30p']) / c['total_buy_30p'] if c['total_buy_30p'] > 0 else 1.0
 
                     if current_time - c['last_close_time'] >= COOLDOWN_PERIOD:
                         if c['pending_side'] is None:
-                            if buy_diff > VOL_DIFF_THRESHOLD and current_price > price_3p_ago:
+                            if buy_diff > VOL_DIFF_THRESHOLD and current_price > price_3_candles_ago:
                                 c['pending_side'] = 'sell_trigger'
                                 c['trigger_price'] = current_price
                                 c['trigger_time'] = current_time
                                 c['trigger_vol_diff'] = buy_diff
                                 print(f"🔍 [{symbol}] Chờ SHORT đảo chiều...")
-                            elif sell_diff > VOL_DIFF_THRESHOLD and current_price < price_3p_ago:
+                            elif sell_diff > VOL_DIFF_THRESHOLD and current_price < price_3_candles_ago:
                                 c['pending_side'] = 'buy_trigger'
                                 c['trigger_price'] = current_price
                                 c['trigger_time'] = current_time
@@ -1602,6 +2061,40 @@ class TradingBot:
         except Exception:
             return default
 
+    def get_available_balance(self):
+        """Vốn còn có thể cấp cho lệnh mới sau khi trừ ký quỹ đang sử dụng."""
+        committed_margin = sum(
+            max(0.0, self._safe_float(pos.get('trade_amount')))
+            for pos in self.positions
+        )
+        return max(0.0, self._safe_float(self.balance) - committed_margin)
+
+    def margin_from_fill(self, symbol, amount, price, leverage, fallback=0.0):
+        """Quy đổi số contract đã khớp thành ký quỹ thực tế."""
+        try:
+            market = exchange.market(symbol)
+            contract_size = self._safe_float(market.get('contractSize'), 1.0)
+            leverage = self._safe_float(leverage)
+            margin = (
+                self._safe_float(amount)
+                * self._safe_float(price)
+                * contract_size
+                / leverage
+            ) if leverage > 0 else 0.0
+            return margin if margin > 0 else self._safe_float(fallback)
+        except Exception:
+            return self._safe_float(fallback)
+
+    def refresh_bot_paused_state(self):
+        """Chỉ dừng săn lệnh mới khi còn chuỗi đã dùng hết số DCA cho phép."""
+        self.bot_paused = any(
+            not pos.get('is_dca_position')
+            and not pos.get('is_rescue_position')
+            and int(pos.get('dca_count', 0)) >= MAX_DCA
+            for pos in self.positions
+        )
+        return self.bot_paused
+
     def get_min_order_amount(self, symbol):
         """Khối lượng tối thiểu sàn cho phép đặt lệnh; 0 nếu market không khai báo."""
         try:
@@ -1799,6 +2292,7 @@ class TradingBot:
             if GLOBAL_TP_ENABLED and okx_pos:
                 self.try_global_tp_for_group(key, group, okx_pos)
 
+    @synchronized_trading
     def try_global_tp_for_group(self, key, group, okx_pos):
         """Nếu vị thế gộp thật đã lời đủ thì đóng lần lượt, lệnh cuối dọn sạch vị thế thật."""
         if any(p.get('is_rescue_position') for p in group):
@@ -1856,7 +2350,7 @@ class TradingBot:
         self.rescue_chains.pop(key, None)
         self.current_max_positions = self.max_positions
         self.active_dca_symbol = None
-        self.bot_paused = False
+        self.refresh_bot_paused_state()
         send_telegram(
             f"🎯 *GLOBAL TP TOÀN COIN*\n"
             f"📍 `{symbol}` - `{side.upper()}`\n"
@@ -1890,6 +2384,7 @@ class TradingBot:
 
         return contribution
 
+    @synchronized_trading
     def try_cut_loser_from_bank(self):
         if not LOSS_BANK_ENABLED or self.loss_bank <= 0:
             return False
@@ -1981,8 +2476,12 @@ class TradingBot:
         filled_amount = sum(self._safe_float(t.get('amount')) for t in matched_trades)
         if filled_amount <= 0:
             filled_amount = self._safe_float(fresh.get('filled'))
+        status = str(fresh.get('status') or order.get('status') or '').lower()
         if filled_amount <= 0:
-            filled_amount = self._safe_float(fallback_amount)
+            raise RuntimeError(
+                f"Không xác minh được fill của order {order_id or 'không có id'} "
+                f"(status={status or 'unknown'}); không cập nhật vị thế ảo."
+            )
 
         if matched_trades and filled_amount > 0:
             avg_price = sum(
@@ -2019,7 +2518,7 @@ class TradingBot:
             'fee': fee,
             'fee_currency': fee_currency,
             'timestamp': fresh.get('timestamp') or int(time.time() * 1000),
-            'status': fresh.get('status'),
+            'status': status,
             'trades': matched_trades,
         }
 
@@ -2241,6 +2740,7 @@ class TradingBot:
             f"✅ Các lệnh phía sau tự dịch xuống DCA1, DCA2 và Rescue kế tiếp"
         )
 
+    @synchronized_trading
     def execute_rescue(self, key, current_price):
         """Cắt 1/3 nguồn và mở Rescue bằng 3 lần ký quỹ phần vừa cắt."""
         chain = self.rescue_chains.get(key)
@@ -2256,47 +2756,69 @@ class TradingBot:
             symbol = source['symbol']
             old_amount = self._safe_float(source.get('amount_coin'))
             old_margin = self._safe_float(source.get('trade_amount'))
-            if old_amount <= 0 or old_margin <= 0:
+            pending = chain.get('pending_rescue')
+            if not pending and (old_amount <= 0 or old_margin <= 0):
                 self.remove_position_from_memory(source)
                 self._promote_rescue_chain(key)
                 return False
 
-            # Cố định mỗi lát theo 1/3 khối lượng lúc bắt đầu cắt nguồn.
-            if chain.get('source_slice_amount', 0) <= 0:
-                chain['source_slice_amount'] = old_amount / RESCUE_SOURCE_SLICES
-            slice_index = int(chain.get('source_slice_index', 0))
-            raw_cut_amount = old_amount if slice_index >= RESCUE_SOURCE_SLICES - 1 else min(old_amount, chain['source_slice_amount'])
-            cut_amount = self._safe_float(exchange.amount_to_precision(symbol, raw_cut_amount))
-            if cut_amount <= 0:
-                return False
+            if pending:
+                # Lát nguồn đã cắt ở vòng trước nhưng order mở Rescue lỗi.
+                # Thử lại đúng Rescue đó, tuyệt đối không cắt thêm nguồn.
+                fill_price = self._safe_float(pending.get('fill_price'), current_price)
+                cut_margin = self._safe_float(pending.get('cut_margin'))
+                carried_loss = self._safe_float(pending.get('carried_loss'))
+                ratio = self._safe_float(pending.get('ratio'))
+                slice_index = int(pending.get('slice_index', 0))
+            else:
+                # Cố định mỗi lát theo 1/3 khối lượng lúc bắt đầu cắt nguồn.
+                if chain.get('source_slice_amount', 0) <= 0:
+                    chain['source_slice_amount'] = old_amount / RESCUE_SOURCE_SLICES
+                slice_index = int(chain.get('source_slice_index', 0))
+                raw_cut_amount = old_amount if slice_index >= RESCUE_SOURCE_SLICES - 1 else min(old_amount, chain['source_slice_amount'])
+                cut_amount = self._safe_float(exchange.amount_to_precision(symbol, raw_cut_amount))
+                if cut_amount <= 0:
+                    return False
 
-            close_side = 'sell' if source['side'] == 'buy' else 'buy'
-            clid = self.make_client_order_id('RSCUT', source.get('position_id'))
-            order = exchange.create_market_order(symbol, close_side, cut_amount, params={
-                'tdMode': MARGIN_MODE, 'reduceOnly': True,
-                'posSide': 'long' if source['side'] == 'buy' else 'short',
-                'clOrdId': clid,
-            })
-            fill = self.resolve_order_fill(order, symbol, current_price, cut_amount)
-            fill_amount = min(fill['amount'] or cut_amount, old_amount)
-            fill_price = fill['price'] or current_price
-            ratio = min(1.0, fill_amount / old_amount)
-            realized = self.calculate_realized_pnl_from_fill(source, fill_price, fill_amount)
-            allocated_entry_fee = source.get('entry_fee', 0.0) * ratio
-            exit_fee = fill['fee'] if fill['fee'] > 0 else old_margin * ratio * source['leverage'] * FEE_RATE
-            carried_loss = max(0.0, -(realized - allocated_entry_fee - exit_fee))
-            cut_margin = old_margin * ratio
+                close_side = 'sell' if source['side'] == 'buy' else 'buy'
+                clid = self.make_client_order_id('RSCUT', source.get('position_id'))
+                order = exchange.create_market_order(symbol, close_side, cut_amount, params={
+                    'tdMode': MARGIN_MODE, 'reduceOnly': True,
+                    'posSide': 'long' if source['side'] == 'buy' else 'short',
+                    'clOrdId': clid,
+                })
+                fill = self.resolve_order_fill(order, symbol, current_price, cut_amount)
+                fill_amount = min(fill['amount'] or cut_amount, old_amount)
+                fill_price = fill['price'] or current_price
+                ratio = min(1.0, fill_amount / old_amount)
+                realized = self.calculate_realized_pnl_from_fill(source, fill_price, fill_amount)
+                allocated_entry_fee = source.get('entry_fee', 0.0) * ratio
+                exit_fee = fill['fee'] if fill['fee'] > 0 else old_margin * ratio * source['leverage'] * FEE_RATE
+                carried_loss = max(0.0, -(realized - allocated_entry_fee - exit_fee))
+                cut_margin = old_margin * ratio
 
-            source['amount_coin'] = max(0.0, old_amount - fill_amount)
-            source['trade_amount'] = max(0.0, old_margin - cut_margin)
-            source['entry_fee'] = max(0.0, source.get('entry_fee', 0.0) - allocated_entry_fee)
-            self.balance += realized - exit_fee
+                source['amount_coin'] = max(0.0, old_amount - fill_amount)
+                source['trade_amount'] = max(0.0, old_margin - cut_margin)
+                source['entry_fee'] = max(0.0, source.get('entry_fee', 0.0) - allocated_entry_fee)
+                self.balance += realized - exit_fee
+
+                # Ghi nhận lát cắt ngay sau khi fill đóng đã thành công. Nếu mở
+                # Rescue lỗi, vòng sau dùng pending_rescue thay vì cắt thêm.
+                chain['source_slice_index'] = slice_index + 1
+                chain['pending_rescue'] = {
+                    'fill_price': fill_price,
+                    'cut_margin': cut_margin,
+                    'carried_loss': carried_loss,
+                    'ratio': ratio,
+                    'slice_index': slice_index,
+                }
 
             rescue_margin = cut_margin * RESCUE_MULTIPLIER
-            if rescue_margin <= 0 or self.balance <= 0:
+            available_balance = self.get_available_balance()
+            if rescue_margin <= 0 or available_balance <= 0:
                 send_telegram(f"⚠️ `{symbol}` đã cắt nguồn nhưng không đủ vốn mở Rescue.")
                 return False
-            rescue_margin = min(self.balance, rescue_margin)
+            rescue_margin = min(available_balance, rescue_margin)
             entry_order, lev, req_amount, est_fee = self.create_entry_order_with_leverage_fallback(
                 symbol=symbol, side=source['side'], price=fill_price,
                 trade_amount=rescue_margin, preferred_leverage=source.get('leverage', LEVERAGE)
@@ -2304,6 +2826,9 @@ class TradingBot:
             rfill = self.resolve_order_fill(entry_order, symbol, fill_price, req_amount)
             rprice = rfill['price'] or fill_price
             ramount = rfill['amount'] or req_amount
+            rescue_margin = self.margin_from_fill(
+                symbol, ramount, rprice, lev, rescue_margin
+            )
             rfee = rfill['fee'] if rfill['fee'] > 0 else est_fee
             self.balance -= rfee
 
@@ -2326,9 +2851,9 @@ class TradingBot:
             }
             self.add_fill_event(rescue, 'RESCUE_OPEN', rfill, rescue_margin, f'Mở Rescue {rescue_number}')
             self.positions.append(rescue)
+            chain.pop('pending_rescue', None)
             chain['next_order'] = rescue['chain_order'] + 1
             chain['next_level'] = int(chain.get('next_level', 3)) + 1
-            chain['source_slice_index'] = slice_index + 1
 
             send_telegram(
                 f"🛟 *MỞ RESCUE {rescue_number}*\n"
@@ -2443,8 +2968,12 @@ class TradingBot:
                 self.active_rescue_closing = False
         return False
 
+    @synchronized_trading
     def open_position(self, symbol, side, price, vol_diff):
-        trade_amount = min(self.balance, self.default_trade_amount)
+        trade_amount = min(self.get_available_balance(), self.default_trade_amount)
+        if trade_amount <= 0:
+            send_telegram(f"⚠️ Không đủ vốn khả dụng để mở `{symbol}`.")
+            return False
         try:
             order, current_leverage, requested_amount, estimated_fee = self.create_entry_order_with_leverage_fallback(
                 symbol=symbol, side=side, price=price, trade_amount=trade_amount, preferred_leverage=LEVERAGE
@@ -2452,6 +2981,9 @@ class TradingBot:
             fill = self.resolve_order_fill(order, symbol, price, requested_amount)
             fill_price = fill['price'] or price
             amount_coin = fill['amount'] or requested_amount
+            trade_amount = self.margin_from_fill(
+                symbol, amount_coin, fill_price, current_leverage, trade_amount
+            )
             entry_fee = fill['fee'] if fill['fee'] > 0 else estimated_fee
             self.balance -= entry_fee
             position_id = self.make_position_id()
@@ -2472,8 +3004,12 @@ class TradingBot:
             self.positions.append(pos)
             print(f"✅ Đã mở lệnh thật: {symbol} x{current_leverage}, amount={amount_coin}, fill={fill_price}")
         except Exception as e:
+            self.bot_paused = True
             print(f"❌ Lỗi mở lệnh: {e}")
-            send_telegram(f"❌ Lỗi mở lệnh {symbol}:\n`{e}`")
+            send_telegram(
+                f"❌ Lỗi mở lệnh {symbol}:\n`{e}`\n"
+                "⏸ Đã dừng săn lệnh mới. Hãy kiểm tra vị thế thật trên OKX trước khi tiếp tục."
+            )
             return
 
         emoji = "🔴" if side == "sell" else "🟢"
@@ -2489,9 +3025,16 @@ class TradingBot:
         for s in SYMBOLS:
             self.coins[s]['pending_side'] = None
 
+    @synchronized_trading
     def execute_dca(self, pos):
+        if pos not in self.positions:
+            return False
         symbol = pos['symbol']
-        trade_amount = min(self.balance, self.default_trade_amount)
+        trade_amount = min(self.get_available_balance(), self.default_trade_amount)
+        if trade_amount <= 0:
+            pos['waiting_dca'] = False
+            send_telegram(f"⚠️ Không đủ vốn khả dụng để DCA `{symbol}`.")
+            return False
         if pos.get('is_dca_position') or pos.get('is_rescue_position') or pos.get('dca_count', 0) >= MAX_DCA:
             pos['waiting_dca'] = False
             return
@@ -2505,6 +3048,9 @@ class TradingBot:
             fill = self.resolve_order_fill(order, symbol, current_price, requested_amount)
             fill_price = fill['price'] or current_price
             amount_coin = fill['amount'] or requested_amount
+            trade_amount = self.margin_from_fill(
+                symbol, amount_coin, fill_price, actual_leverage, trade_amount
+            )
             entry_fee = fill['fee'] if fill['fee'] > 0 else estimated_fee
             self.balance -= entry_fee
             dca_position_id = self.make_position_id()
@@ -2536,17 +3082,28 @@ class TradingBot:
                 f"💵 Ký quỹ: `${trade_amount:,.2f}`"
             )
             if pos['dca_count'] >= MAX_DCA:
-                self.bot_paused = True
-                send_telegram(f"🚨 {symbol} đã mở đủ {MAX_DCA} lệnh DCA riêng\n🚨 Bot tạm dừng để xử lý thủ công")
+                self.refresh_bot_paused_state()
+                send_telegram(
+                    f"🚨 {symbol} đã mở đủ {MAX_DCA} lệnh DCA riêng\n"
+                    "⏸ Bot chỉ dừng săn lệnh gốc mới; TP, Rescue, đồng bộ và quản lý "
+                    "các vị thế đang mở vẫn tiếp tục."
+                )
         except Exception as e:
             pos['waiting_dca'] = False
+            self.bot_paused = True
             print(f"DCA lỗi: {e}")
-            send_telegram(f"❌ Lỗi mở lệnh DCA riêng {symbol}:\n`{e}`")
+            send_telegram(
+                f"❌ Lỗi mở lệnh DCA riêng {symbol}:\n`{e}`\n"
+                "⏸ Đã dừng săn lệnh mới; quản lý vị thế hiện có vẫn chạy."
+            )
 
+    @synchronized_trading
     def rebuild_small_loser_position(self, pos):
+        if pos not in self.positions:
+            return False
         if pos.get('trade_amount', 0) > REBUILD_TRIGGER_TRADE_AMOUNT or pos.get('rebuilding'):
             return False
-        if self.balance < REBUILD_ADD_AMOUNT:
+        if self.get_available_balance() < REBUILD_ADD_AMOUNT:
             return False
         symbol = pos['symbol']
         current_price = self.update_coin_data(symbol)
@@ -2679,6 +3236,7 @@ class TradingBot:
         return True, info
 
 
+    @synchronized_trading
     def restore_cut_position_to_original(self, pos, current_price, available_profit):
         if not RESTORE_CUT_POSITION_TO_ORIGINAL or not pos or pos not in self.positions:
             return 0
@@ -2686,7 +3244,7 @@ class TradingBot:
             return 0
         target = float(pos.get('original_trade_amount', RESTORE_TARGET_TRADE_AMOUNT))
         missing = target - pos.get('trade_amount', 0)
-        restore_amount = min(missing, available_profit)
+        restore_amount = min(missing, available_profit, self.get_available_balance())
         if restore_amount < MIN_RESTORE_ADD_AMOUNT:
             return 0
         symbol = pos['symbol']
@@ -2728,6 +3286,7 @@ class TradingBot:
             send_telegram(f"❌ Lỗi phục hồi ký quỹ {symbol}:\n`{e}`")
             return 0
 
+    @synchronized_trading
     def reduce_biggest_loser_after_tp(self, tp_profit):
 
         # Dùng một phần tiền lời vừa TP để cắt bớt lệnh âm nặng,
@@ -2781,8 +3340,7 @@ class TradingBot:
             return
 
         try:
-
-            exchange.create_market_order(
+            order = exchange.create_market_order(
                 symbol,
                 close_side,
                 close_amount,
@@ -2792,6 +3350,15 @@ class TradingBot:
                     "posSide": "long" if biggest_loser['side'] == "buy" else "short"
                 }
             )
+            fill = self.resolve_order_fill(
+                order, symbol, biggest_loser_price, close_amount
+            )
+            filled_amount = min(
+                self._safe_float(fill.get('amount')),
+                self._safe_float(biggest_loser.get('amount_coin'))
+            )
+            if filled_amount <= 0:
+                raise RuntimeError("OKX chưa xác nhận khối lượng cắt lỗ đã khớp.")
 
         except Exception as e:
 
@@ -2803,8 +3370,18 @@ class TradingBot:
 
             return
 
-        partial_loss = biggest_loss * close_ratio
-        partial_exit_fee = full_exit_fee * close_ratio
+        close_ratio = min(
+            1.0,
+            filled_amount / self._safe_float(biggest_loser.get('amount_coin'))
+        )
+        fill_price = self._safe_float(fill.get('price'), biggest_loser_price)
+        realized_pnl = self.calculate_realized_pnl_from_fill(
+            biggest_loser, fill_price, filled_amount
+        )
+        partial_loss = max(0.0, -realized_pnl)
+        partial_exit_fee = self._safe_float(fill.get('fee'))
+        if partial_exit_fee <= 0:
+            partial_exit_fee = full_exit_fee * close_ratio
         estimated_net_loss = partial_loss + partial_exit_fee
 
         # Cập nhật position ảo của bot sau khi đóng một phần.
@@ -2826,8 +3403,8 @@ class TradingBot:
             f"📍 Lệnh âm: `{symbol}`\n"
             f"📉 Đang âm khoảng: `{biggest_loss_percent:.1f}%` ký quỹ\n"
             f"💰 Lời TP vừa đóng: `${tp_profit:.4f}`\n"
-            f"✂️ Cắt lỗ một phần ước tính: `${estimated_net_loss:.4f}`\n"
-            f"📦 Đã đóng khoảng: `{close_ratio*100:.1f}%` khối lượng lệnh âm\n"
+            f"✂️ Lỗ và phí theo fill: `${estimated_net_loss:.4f}`\n"
+            f"📦 Đã đóng: `{close_ratio*100:.1f}%` khối lượng lệnh âm\n"
             f"📊 Ký quỹ còn lại: `${biggest_loser['trade_amount']:.4f}`"
         )
 
@@ -2859,6 +3436,8 @@ class TradingBot:
     def remove_position_from_memory(self, pos):
         symbol = pos.get('symbol')
         side = pos.get('side')
+        root_id = pos.get('root_id')
+        was_dca = bool(pos.get('is_dca_position'))
         key = self.get_position_key(symbol, side) if symbol and side else None
         was_source = bool(key and self.rescue_chains.get(key, {}).get('source_position_id') == pos.get('position_id'))
 
@@ -2867,19 +3446,23 @@ class TradingBot:
 
         if was_source and any(p['symbol'] == symbol and p['side'] == side for p in self.positions):
             self._promote_rescue_chain(key)
+        elif was_dca and root_id is not None:
+            self.refresh_root_dca_count(root_id)
+
+        self.refresh_bot_paused_state()
 
         if symbol and not any(p['symbol'] == symbol for p in self.positions):
             self.current_max_positions = self.max_positions
             self.active_dca_symbol = None
-            self.bot_paused = False
             if key:
                 self.rescue_chains.pop(key, None)
 
+    @synchronized_trading
     def close_tiny_position_if_needed(self, pos, current_price):
         # Dọn các mảnh vị thế còn quá nhỏ sau nhiều lần cắt lỗ một phần.
         # Mục tiêu: tránh kiểu OKX còn hiện khối lượng bé xíu, ký quỹ gần 0,
         # còn bot thì vẫn quản lý và báo cáo như một lệnh bình thường.
-        if not current_price:
+        if pos not in self.positions or not current_price:
             return False
 
         try:
@@ -2903,7 +3486,7 @@ class TradingBot:
 
             if close_amount > 0:
                 try:
-                    exchange.create_market_order(
+                    order = exchange.create_market_order(
                         symbol,
                         close_side,
                         close_amount,
@@ -2913,6 +3496,23 @@ class TradingBot:
                             "posSide": "long" if pos['side'] == "buy" else "short"
                         }
                     )
+                    fill = self.resolve_order_fill(
+                        order, symbol, current_price, close_amount
+                    )
+                    filled_amount = self._safe_float(fill.get('amount'))
+                    if filled_amount + OKX_SYNC_ABS_TOLERANCE < close_amount:
+                        ratio = max(
+                            0.0,
+                            min(1.0, filled_amount / close_amount)
+                        )
+                        pos['amount_coin'] *= (1.0 - ratio)
+                        pos['trade_amount'] *= (1.0 - ratio)
+                        pos['entry_fee'] *= (1.0 - ratio)
+                        send_telegram(
+                            f"⚠️ `{symbol}` chỉ khớp một phần lệnh dọn nhỏ; "
+                            "bot giữ lại phần chưa đóng để tiếp tục quản lý."
+                        )
+                        return False
                     send_telegram(
                         f"🧹 *DỌN LỆNH QUÁ NHỎ*\n"
                         f"📍 `{symbol}`\n"
@@ -2921,12 +3521,23 @@ class TradingBot:
                         f"✅ Đã gửi lệnh đóng phần còn lại."
                     )
                 except Exception as e:
-                    # Nếu sàn từ chối vì amount quá nhỏ, bot xóa khỏi bộ nhớ để khỏi quản lý sai.
                     send_telegram(
-                        f"🧹 *XÓA LỆNH QUÁ NHỎ KHỎI BOT*\n"
+                        f"⚠️ *CHƯA ĐÓNG ĐƯỢC LỆNH QUÁ NHỎ*\n"
                         f"📍 `{symbol}`\n"
-                        f"⚠️ Sàn không cho đóng vì quá nhỏ hoặc đã hết vị thế:\n`{e}`"
+                        f"⚠️ Sàn từ chối lệnh đóng:\n`{e}`\n"
+                        "✅ Bot vẫn giữ lệnh trong bộ nhớ và sẽ kiểm tra lại."
                     )
+                    snapshot = self.fetch_okx_position_snapshot_for_symbols([symbol])
+                    okx_pos = snapshot.get(self.get_position_key(symbol, pos['side'])) if snapshot else None
+                    if snapshot is None:
+                        remaining = None
+                    else:
+                        remaining = (
+                            abs(self._safe_float(okx_pos.get('contracts')))
+                            if okx_pos else 0.0
+                        )
+                    if remaining is None or remaining > OKX_SYNC_ABS_TOLERANCE:
+                        return False
 
             self.remove_position_from_memory(pos)
             return True
@@ -2936,7 +3547,10 @@ class TradingBot:
             return False
 
 
+    @synchronized_trading
     def close_position(self, pos, price, reason):
+        if pos not in self.positions:
+            return 0.0
         symbol = pos['symbol']
         key = self.get_position_key(symbol, pos['side'])
         close_side = 'sell' if pos['side'] == 'buy' else 'buy'
@@ -2949,6 +3563,12 @@ class TradingBot:
 
         # Luôn xem vị thế thật trên OKX trước khi đóng để tránh gửi amount rác.
         snapshot = self.fetch_okx_position_snapshot()
+        if snapshot is None:
+            send_telegram(
+                f"⚠️ Không lấy được snapshot OKX của `{symbol}`.\n"
+                "✅ Bot giữ nguyên lệnh trong bộ nhớ và sẽ thử TP lại sau."
+            )
+            return 0.0
         okx_pos = snapshot.get(key) if snapshot else None
         actual_amount = abs(self._safe_float(okx_pos.get('contracts'))) if okx_pos else 0.0
 
@@ -3032,6 +3652,17 @@ class TradingBot:
             if is_last_managed_position:
                 for _ in range(2):
                     snapshot = self.fetch_okx_position_snapshot()
+                    if snapshot is None:
+                        leftover_actual = max(
+                            leftover_actual,
+                            max(0.0, requested_amount - fill_amount - extra_closed),
+                            self._safe_float(self.ignored_residuals.get(key))
+                        )
+                        send_telegram(
+                            f"⚠️ Không xác minh được phần dư `{symbol}` do lỗi snapshot OKX. "
+                            "Bot giữ lại dấu vết residual để kiểm tra vòng sau."
+                        )
+                        break
                     okx_pos = snapshot.get(key) if snapshot else None
                     remaining_raw = abs(self._safe_float(okx_pos.get('contracts'))) if okx_pos else 0.0
                     remaining_actual = self._safe_float(exchange.amount_to_precision(symbol, remaining_raw))
@@ -3099,11 +3730,14 @@ class TradingBot:
             try:
                 time.sleep(0.8)
                 verify_snapshot = self.fetch_okx_position_snapshot_for_symbols([symbol])
-                verify_pos = verify_snapshot.get(key) if verify_snapshot else None
-                verify_amount = (
-                    abs(self._safe_float(verify_pos.get('contracts')))
-                    if verify_pos else 0.0
-                )
+                if verify_snapshot is None:
+                    verify_amount = None
+                else:
+                    verify_pos = verify_snapshot.get(key)
+                    verify_amount = (
+                        abs(self._safe_float(verify_pos.get('contracts')))
+                        if verify_pos else 0.0
+                    )
             except Exception:
                 verify_amount = None
 
@@ -3154,7 +3788,8 @@ class TradingBot:
         msg = (
             f"📊 *GIÁM SÁT HỆ THỐNG*\n"
             f"{search_status}\n"
-            f"🏦 Vốn: `${self.balance:,.2f}$`\n"
+            f"🏦 Vốn ghi sổ: `${self.balance:,.2f}$`\n"
+            f"💳 Vốn khả dụng: `${self.get_available_balance():,.2f}$`\n"
             f"📦 Slot lệnh gốc: `{self.count_root_positions()}/{self.max_positions}`\n"
             f"💵 Vốn mỗi lệnh mới: `${self.default_trade_amount:g}`\n"
             f"🏦 Quỹ cắt lỗ: `${self.loss_bank:.4f}`\n"
