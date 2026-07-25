@@ -418,6 +418,58 @@ class TradingBot:
         except Exception:
             return False, None
 
+    def _auto_complete_recovery_prices(self, group, root_price):
+        """
+        Suy ngược giá DCA từ giá gộp OKX với giả định mỗi lát dùng cùng vốn.
+        - 2 lát: nghiệm DCA1 là duy nhất.
+        - 3 lát: lấy DCA1 tại đúng ngưỡng chiến lược rồi giải DCA2.
+        """
+        slice_count = int(group.get('slice_count', 1))
+        okx_avg = self._safe_float(group.get('okx_entry_price'))
+        leverage = self._safe_float(group.get('leverage'), LEVERAGE)
+        if root_price <= 0 or okx_avg <= 0 or leverage <= 0:
+            raise ValueError("Thiếu giá gốc, giá trung bình OKX hoặc leverage.")
+        if slice_count == 1:
+            return [root_price]
+
+        inverse_target = slice_count / okx_avg
+        if slice_count == 2:
+            inverse_dca1 = inverse_target - (1.0 / root_price)
+            if inverse_dca1 <= 0:
+                raise ValueError("Không giải được giá DCA1 dương từ giá gốc này.")
+            prices = [root_price, 1.0 / inverse_dca1]
+            if (
+                group['side'] == 'buy' and prices[1] >= prices[0]
+            ) or (
+                group['side'] == 'sell' and prices[1] <= prices[0]
+            ):
+                raise ValueError("Giá DCA1 suy ra không đúng chiều DCA của vị thế.")
+            return prices
+
+        if slice_count == 3:
+            dca_step = 1.0 / leverage
+            if group['side'] == 'buy':
+                dca1_price = root_price * (1.0 - dca_step)
+            else:
+                dca1_price = root_price * (1.0 + dca_step)
+            inverse_dca2 = (
+                inverse_target
+                - (1.0 / root_price)
+                - (1.0 / dca1_price)
+            )
+            if dca1_price <= 0 or inverse_dca2 <= 0:
+                raise ValueError("Không giải được giá DCA2 dương từ giá gốc này.")
+            prices = [root_price, dca1_price, 1.0 / inverse_dca2]
+            if (
+                group['side'] == 'buy' and not (prices[2] < prices[1] < prices[0])
+            ) or (
+                group['side'] == 'sell' and not (prices[2] > prices[1] > prices[0])
+            ):
+                raise ValueError("Giá DCA2 suy ra không đúng thứ tự giá của chuỗi DCA.")
+            return prices
+
+        raise ValueError("Chỉ hỗ trợ tự tính tối đa LỆNH GỐC + DCA1 + DCA2.")
+
     def guard_unmanaged_okx_positions_on_startup(self):
         """Không săn lệnh mới nếu OKX đã có vị thế nhưng RAM bot đang trống."""
         if self.startup_position_check_done:
@@ -466,7 +518,6 @@ class TradingBot:
             self._send_next_recovery_question()
             return
 
-        role = self._recovery_role_name(price_index)
         send_telegram(
             "🧩 *KHÔI PHỤC GIÁ VÀO RIÊNG*\n"
             f"📍 `{group['symbol']}` - `{group['side'].upper()}`\n"
@@ -474,7 +525,8 @@ class TradingBot:
             f"📦 Tổng contract OKX: `{group['contracts']}`\n"
             f"💵 Ký quỹ ước tính: `${group['estimated_margin']:.4f}`\n"
             f"🧱 Bot nhận diện: `{group['slice_count']}` lệnh riêng\n\n"
-            f"➡️ Hãy gửi *GIÁ VÀO CỦA {role}* dưới dạng số.\n"
+            "➡️ Chỉ cần gửi *GIÁ VÀO CỦA LỆNH GỐC* dưới dạng số.\n"
+            "Bot sẽ tự tính DCA1/DCA2 để giá gộp khớp OKX.\n"
             "Ví dụ: `0.012345`\n"
             "Hủy toàn bộ bằng: `HUY KHOI PHUC`"
         )
@@ -627,11 +679,33 @@ class TradingBot:
             return False
 
         group = session['groups'][session['group_index']]
-        group['entry_prices'].append(price)
+        try:
+            group['entry_prices'] = self._auto_complete_recovery_prices(
+                group, price
+            )
+        except Exception as e:
+            group['entry_prices'].clear()
+            send_telegram(
+                f"⚠️ Không thể tự tính giá DCA từ giá gốc `{price}`:\n`{e}`\n"
+                "🔄 Hãy kiểm tra và nhập lại giá LỆNH GỐC."
+            )
+            self._send_next_recovery_question()
+            return False
+
         send_telegram(
-            f"✅ Đã ghi giá `{self._recovery_role_name(len(group['entry_prices']) - 1)}` "
-            f"của `{group['symbol']}`: `{price}`"
+            f"✅ Đã ghi giá LỆNH GỐC của `{group['symbol']}`: `{price}`"
         )
+        if group['slice_count'] > 1:
+            calculated = "\n".join(
+                f"• {self._recovery_role_name(index)}: `{entry_price}`"
+                for index, entry_price in enumerate(group['entry_prices'][1:], start=1)
+            )
+            send_telegram(
+                "🧮 *GIÁ DCA BOT TỰ TÍNH*\n"
+                f"📍 `{group['symbol']}` - `{group['side'].upper()}`\n"
+                f"{calculated}\n"
+                f"🏦 Mục tiêu giá gộp OKX: `{group['okx_entry_price']}`"
+            )
         if len(group['entry_prices']) >= group['slice_count']:
             valid_prices, recovered_avg = self._validate_recovery_group_prices(group)
             if not valid_prices:
