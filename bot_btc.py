@@ -386,6 +386,38 @@ class TradingBot:
             return 'LỆNH GỐC'
         return f'DCA{index}'
 
+    def _validate_recovery_group_prices(self, group):
+        """Kiểm tra các giá riêng có tái tạo gần đúng giá trung bình OKX không."""
+        prices = group.get('entry_prices') or []
+        if len(prices) != group.get('slice_count'):
+            return False, None
+        try:
+            market = exchange.market(group['symbol'])
+            contract_size = self._safe_float(market.get('contractSize'), 1.0)
+            leverage = self._safe_float(group.get('leverage'), LEVERAGE)
+            raw_weights = [
+                (self.default_trade_amount * leverage) / (price * contract_size)
+                for price in prices
+            ]
+            weight_total = sum(raw_weights)
+            if weight_total <= 0:
+                return False, None
+            amounts = [
+                group['contracts'] * weight / weight_total
+                for weight in raw_weights
+            ]
+            recovered_avg = (
+                sum(price * amount for price, amount in zip(prices, amounts))
+                / group['contracts']
+            )
+            okx_avg = self._safe_float(group.get('okx_entry_price'))
+            if okx_avg <= 0:
+                return False, recovered_avg
+            avg_error = abs(recovered_avg - okx_avg) / okx_avg
+            return avg_error <= OKX_SYNC_REL_TOLERANCE, recovered_avg
+        except Exception:
+            return False, None
+
     def guard_unmanaged_okx_positions_on_startup(self):
         """Không săn lệnh mới nếu OKX đã có vị thế nhưng RAM bot đang trống."""
         if self.startup_position_check_done:
@@ -601,6 +633,28 @@ class TradingBot:
             f"của `{group['symbol']}`: `{price}`"
         )
         if len(group['entry_prices']) >= group['slice_count']:
+            valid_prices, recovered_avg = self._validate_recovery_group_prices(group)
+            if not valid_prices:
+                okx_avg = self._safe_float(group.get('okx_entry_price'))
+                error_percent = (
+                    abs(self._safe_float(recovered_avg) - okx_avg) / okx_avg * 100
+                    if recovered_avg is not None and okx_avg > 0 else None
+                )
+                group['entry_prices'].clear()
+                send_telegram(
+                    "⚠️ *GIÁ KHÔI PHỤC CHƯA KHỚP OKX*\n"
+                    f"📍 `{group['symbol']}` - `{group['side'].upper()}`\n"
+                    f"🏦 Giá trung bình OKX: `{okx_avg}`\n"
+                    f"🧮 Giá gộp từ các giá vừa nhập: "
+                    f"`{recovered_avg if recovered_avg is not None else 'không tính được'}`\n"
+                    f"📉 Độ lệch: "
+                    f"`{f'{error_percent:.2f}%' if error_percent is not None else 'không xác định'}`\n"
+                    f"📏 Mức cho phép: `{OKX_SYNC_REL_TOLERANCE*100:.0f}%`\n"
+                    "🔄 Bot sẽ hỏi lại riêng coin này từ LỆNH GỐC; "
+                    "không cần nhắn `KHOI PHUC` lại."
+                )
+                self._send_next_recovery_question()
+                return False
             session['group_index'] += 1
         self._send_next_recovery_question()
         return True
