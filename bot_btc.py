@@ -25,7 +25,7 @@ REVERSAL_5M_CACHE_SECONDS = 5 # chỉ tải nến 5m cho coin đang chờ đảo
 COOLDOWN_PERIOD = 11 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
 CONFIRMATION_TIME = 11 # thời gian tối thiểu xác nhận cú đẩy
-SIGNAL_TIMEOUT = 11 * 60 # tối đa 11 phút để đủ surge + volume + Bollinger
+SIGNAL_TIMEOUT = 59 * 60 # tối đa 59 phút để đủ surge + volume + Bollinger
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
 REVERSAL_ENTRY_CALLBACK = 0.004 # hồi ngược 0.4% từ đỉnh/đáy mới vào lệnh
 REVERSAL_WAIT_TIMEOUT = 15 * 60 # tối đa 15 phút chờ đảo chiều thật
@@ -1724,14 +1724,6 @@ class TradingBot:
         coin_state['waiting_reversal'] = True
         coin_state['reversal_extreme_price'] = current_price
         coin_state['reversal_start_time'] = time.time()
-        direction = "đỉnh giảm lại để SHORT" if coin_state['pending_side'] == 'sell_trigger' else "đáy hồi lên để LONG"
-        send_telegram(
-            f"⏳ *CHỜ ĐẢO CHIỀU THẬT*\n"
-            f"📍 `{symbol}`\n"
-            f"🎯 Đã đủ volume + Bollinger; đang ghi nhận {direction}.\n"
-            f"↩️ Chỉ vào khi giá hồi ngược ít nhất `{REVERSAL_ENTRY_CALLBACK*100:.2f}%` "
-            "và nến 5m đổi màu."
-        )
 
     def is_valid_bb_zone(self, side, current_price, upper, middle, lower):
 
