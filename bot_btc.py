@@ -21,19 +21,25 @@ CHECK_INTERVAL = 5 # quét giá
 WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # cửa sổ tính volume theo chiến lược gốc
 OHLCV_CACHE_SECONDS = 30 # nến 1h không cần tải lại cho mỗi lần đọc giá
+REVERSAL_5M_CACHE_SECONDS = 5 # chỉ tải nến 5m cho coin đang chờ đảo chiều
 COOLDOWN_PERIOD = 11 # thời gian khóa coi sau khi trây xong
 VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
-CONFIRMATION_TIME = 60 # thời gian xác nhận tín hiệu
+CONFIRMATION_TIME = 11 # thời gian tối thiểu xác nhận cú đẩy
+SIGNAL_TIMEOUT = 11 * 60 # tối đa 11 phút để đủ surge + volume + Bollinger
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
+REVERSAL_ENTRY_CALLBACK = 0.004 # hồi ngược 0.4% từ đỉnh/đáy mới vào lệnh
+REVERSAL_WAIT_TIMEOUT = 15 * 60 # tối đa 15 phút chờ đảo chiều thật
 STATUS_REPORT_INTERVAL = 1800 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
 MAX_POSITIONS = 10 # số lệnh tối đa cùng lúc
-MAX_DCA = 2
+MAX_DCA = 0 # chiến lược mới: bỏ DCA1/DCA2, đi thẳng từ ROOT sang RESCUE
 TP_NET_PROFIT_USD = 2.0
 RESCUE_ENABLED = True
 RESCUE_PROFIT_USD = 2.0
 RESCUE_SOURCE_SLICES = 3
 RESCUE_MULTIPLIER = 3.0
+RESCUE_AVG_TP_MIN_NET_USD = 1.0
+RESCUE_EXTERNAL_HELP_FROM_NUMBER = 3
 MARGIN_MODE = "cross" # isolated = Cô lập trên OKX, cross = Chéo
 
 # --- KIỂM TRA MỞ/ĐÓNG LỆNH THẬT QUA TELEGRAM ---
@@ -159,6 +165,9 @@ class TradingBot:
         # Trạng thái Rescue theo từng coin + chiều.
         self.rescue_chains = {}
         self.active_rescue_closing = False
+        # Chi tiết lần đóng gần nhất dùng để đối chiếu PnL ảo với PnL theo
+        # giá trung bình gộp thật của OKX.
+        self.last_close_accounting = {}
 
         # Khối lượng thật còn trên OKX nhưng bot đã chủ động quên khỏi một lệnh ảo
         # sau TP khớp một phần hoặc lệnh XR. Khối lượng này không chiếm slot DCA.
@@ -189,6 +198,9 @@ class TradingBot:
                 'trigger_price': 0,
                 'trigger_time': 0,
                 'trigger_vol_diff': 0, 
+                'waiting_reversal': False,
+                'reversal_extreme_price': 0,
+                'reversal_start_time': 0,
                 'last_close_time': 0,
                 'total_buy_30p': 0.0,
                 'total_sell_30p': 0.0,
@@ -203,6 +215,7 @@ class TradingBot:
         self.last_status_time = time.time()
         self.is_warmed_up = False
         self.bb_1m_cache = {}
+        self.reversal_5m_cache = {}
 
         # D/T Telegram: D = dừng săn lệnh mới, T = tiếp tục săn lệnh mới.
         # Các lệnh đang mở vẫn được quản lý TP/DCA/cắt lỗ bình thường.
@@ -497,7 +510,7 @@ class TradingBot:
                 "🛡 *PHÁT HIỆN VỊ THẾ OKX KHI BOT VỪA KHỞI ĐỘNG*\n"
                 f"📦 Có `{len(active)}` vị thế coin/chiều nhưng bộ nhớ lệnh riêng đang trống.\n"
                 "👁 Bot đã tự khóa ở CHẾ ĐỘ XEM và không săn lệnh mới.\n"
-                "➡️ Nhắn `KHOI PHUC` để dựng lại LỆNH GỐC/DCA."
+                "➡️ Nhắn `KHOI PHUC` để dựng lại một ROOT theo giá trung bình OKX."
             )
         return True
 
@@ -602,15 +615,9 @@ class TradingBot:
                     item.get('initialMargin'), self._safe_float(info.get('margin'))
                 ))
 
-            # Làm tròn theo lệnh chuẩn: 0-14.99$ => 1 lệnh, 15-24.99$ => 2...
-            standard_margin = max(0.01, self._safe_float(self.default_trade_amount, DEFAULT_TRADE_AMOUNT))
-            slice_count = max(1, int((estimated_margin / standard_margin) + 0.5))
-            if slice_count > MAX_DCA + 1:
-                unsupported.append(
-                    f"`{symbol}` `{side.upper()}` ≈ `{slice_count}` lệnh "
-                    "(có thể đã vào Rescue/cắt/bơm)"
-                )
-                continue
+            # Chiến lược mới không dựng lại DCA/RESCUE ảo. Toàn bộ vị thế thật
+            # được tiếp quản như một ROOT duy nhất tại giá trung bình OKX.
+            slice_count = 1
 
             groups.append({
                 'symbol': symbol,
@@ -624,14 +631,6 @@ class TradingBot:
                 'entry_prices': [],
             })
 
-        if unsupported:
-            send_telegram(
-                "⛔ *CHƯA THỂ KHÔI PHỤC AN TOÀN*\n"
-                "Các vị thế sau vượt quá LỆNH GỐC + DCA1 + DCA2:\n"
-                + "\n".join(unsupported)
-                + "\n📌 Bot không đoán Rescue vì cần thêm carried_loss và lịch sử cắt nguồn."
-            )
-            return False
         if not groups:
             send_telegram(
                 "ℹ️ OKX không có vị thế swap USDT nào để khôi phục.\n"
@@ -657,6 +656,7 @@ class TradingBot:
         send_telegram(
             "🔎 *BẮT ĐẦU KHÔI PHỤC TỪ OKX*\n"
             f"📦 Phát hiện `{len(groups)}` vị thế coin/chiều.\n"
+            "🧱 Mỗi vị thế sẽ được dựng thành một ROOT duy nhất tại giá trung bình OKX.\n"
             "👁 Bot đã khóa ở CHẾ ĐỘ XEM và chưa gửi bất kỳ order nào."
         )
         self._send_next_recovery_question()
@@ -820,6 +820,7 @@ class TradingBot:
                         'rebuild_count': 0,
                         'fills': [],
                         'recovered_from_okx': True,
+                        'recovery_debt': 0.0,
                     }
                     if index > 0:
                         pos['dca_number'] = index
@@ -850,7 +851,7 @@ class TradingBot:
             self.refresh_bot_paused_state()
             lines = [
                 "✅ *KHÔI PHỤC HOÀN TẤT TRONG CHẾ ĐỘ XEM*",
-                f"📚 Đã dựng lại `{len(recovered)}` lệnh riêng.",
+                f"📚 Đã dựng lại `{len(recovered)}` ROOT theo giá trung bình OKX.",
             ]
             for group in session['groups']:
                 labels = ", ".join(
@@ -906,9 +907,7 @@ class TradingBot:
         for symbol in matching_markets:
             coin_state = self.coins.get(symbol)
             if coin_state:
-                coin_state['pending_side'] = None
-                coin_state['waiting_bb'] = False
-                coin_state['bb_wait_candle'] = 0
+                self.reset_coin_signal(coin_state)
 
         send_telegram(
             f"🚫 *ĐÃ THÊM VÀO DANH SÁCH ĐEN TẠM THỜI*\n"
@@ -1389,9 +1388,7 @@ class TradingBot:
 
         # Hủy các tín hiệu vào lệnh đang chờ để chúng không chạy lại khi bật chế độ thường.
         for coin_state in self.coins.values():
-            coin_state['pending_side'] = None
-            coin_state['waiting_bb'] = False
-            coin_state['bb_wait_candle'] = 0
+            self.reset_coin_signal(coin_state)
 
         # Không giữ yêu cầu DCA đang xếp hàng. Khi quay lại chế độ chạy,
         # bot sẽ tự xét lại ngưỡng DCA theo giá hiện tại.
@@ -1663,6 +1660,38 @@ class TradingBot:
             print(f"Lỗi cập nhật {symbol}: {e}")
             return None
 
+    def get_reversal_5m_candle(self, symbol):
+        """Lấy nến 5m đang chạy để xác nhận nhịp đảo chiều sau tín hiệu 1h."""
+        now = time.time()
+        cached = self.reversal_5m_cache.get(symbol)
+        if cached and now - cached['fetch_time'] < REVERSAL_5M_CACHE_SECONDS:
+            return cached['candle']
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=2)
+            if not ohlcv:
+                return None
+            row = ohlcv[-1]
+            candle = {
+                'timestamp': row[0],
+                'open': self._safe_float(row[1]),
+                'high': self._safe_float(row[2]),
+                'low': self._safe_float(row[3]),
+                'close': self._safe_float(row[4]),
+            }
+            if min(
+                candle['open'], candle['high'],
+                candle['low'], candle['close']
+            ) <= 0:
+                return None
+            self.reversal_5m_cache[symbol] = {
+                'fetch_time': now,
+                'candle': candle,
+            }
+            return candle
+        except Exception as e:
+            print(f"⚠️ Không lấy được nến 5m xác nhận đảo chiều {symbol}: {e}")
+            return None
+
     def calculate_bollinger_bands(self, prices, period=20, std_dev=2):
         if len(prices) < period:
             return None, None, None
@@ -1682,6 +1711,27 @@ class TradingBot:
             if pos['symbol'] == symbol:
                     return True
         return False
+
+    def reset_coin_signal(self, coin_state):
+        coin_state['pending_side'] = None
+        coin_state['waiting_bb'] = False
+        coin_state['bb_wait_candle'] = 0
+        coin_state['waiting_reversal'] = False
+        coin_state['reversal_extreme_price'] = 0
+        coin_state['reversal_start_time'] = 0
+
+    def arm_reversal_entry(self, symbol, coin_state, current_price):
+        coin_state['waiting_reversal'] = True
+        coin_state['reversal_extreme_price'] = current_price
+        coin_state['reversal_start_time'] = time.time()
+        direction = "đỉnh giảm lại để SHORT" if coin_state['pending_side'] == 'sell_trigger' else "đáy hồi lên để LONG"
+        send_telegram(
+            f"⏳ *CHỜ ĐẢO CHIỀU THẬT*\n"
+            f"📍 `{symbol}`\n"
+            f"🎯 Đã đủ volume + Bollinger; đang ghi nhận {direction}.\n"
+            f"↩️ Chỉ vào khi giá hồi ngược ít nhất `{REVERSAL_ENTRY_CALLBACK*100:.2f}%` "
+            "và nến 5m đổi màu."
+        )
 
     def is_valid_bb_zone(self, side, current_price, upper, middle, lower):
 
@@ -1918,25 +1968,63 @@ class TradingBot:
                                 c['trigger_price'] = current_price
                                 c['trigger_time'] = current_time
                                 c['trigger_vol_diff'] = buy_diff
+                                c['waiting_reversal'] = False
+                                c['reversal_extreme_price'] = current_price
+                                c['reversal_start_time'] = 0
                                 print(f"🔍 [{symbol}] Chờ SHORT đảo chiều...")
                             elif sell_diff > VOL_DIFF_THRESHOLD and current_price < price_3_candles_ago:
                                 c['pending_side'] = 'buy_trigger'
                                 c['trigger_price'] = current_price
                                 c['trigger_time'] = current_time
                                 c['trigger_vol_diff'] = sell_diff
+                                c['waiting_reversal'] = False
+                                c['reversal_extreme_price'] = current_price
+                                c['reversal_start_time'] = 0
                                 print(f"🔍 [{symbol}] Chờ LONG đảo chiều...")
                         else:
                             elapsed = current_time - c['trigger_time']
                             price_change = (current_price - c['trigger_price']) / c['trigger_price']
                             
                             if c['pending_side'] == 'sell_trigger':
+                                if c.get('waiting_reversal'):
+                                    reversal_elapsed = current_time - c.get('reversal_start_time', current_time)
+                                    reversal_candle = self.get_reversal_5m_candle(symbol)
+                                    if not reversal_candle:
+                                        if reversal_elapsed >= REVERSAL_WAIT_TIMEOUT:
+                                            self.reset_coin_signal(c)
+                                        continue
+                                    reversal_price = reversal_candle['close']
+                                    c['reversal_extreme_price'] = max(
+                                        self._safe_float(c.get('reversal_extreme_price'), reversal_candle['high']),
+                                        reversal_candle['high']
+                                    )
+                                    peak_price = c['reversal_extreme_price']
+                                    retrace = (
+                                        (peak_price - reversal_price) / peak_price
+                                        if peak_price > 0 else 0.0
+                                    )
+                                    is_reversal_red = (
+                                        reversal_candle['close'] < reversal_candle['open']
+                                    )
+                                    if retrace >= REVERSAL_ENTRY_CALLBACK and is_reversal_red:
+                                        send_telegram(
+                                            f"✅ `{symbol}` xác nhận đảo chiều SHORT: "
+                                            f"nến 5m giảm `{retrace*100:.2f}%` từ đỉnh `{peak_price}`"
+                                        )
+                                        self.open_position(symbol, 'sell', reversal_price, buy_diff)
+                                        self.reset_coin_signal(c)
+                                        break
+
+                                    if reversal_elapsed >= REVERSAL_WAIT_TIMEOUT:
+                                        print(f"⌛ [{symbol}] SHORT hết thời gian chờ đảo chiều")
+                                        self.reset_coin_signal(c)
+                                    continue
+
                                 if current_price < c['trigger_price'] * 0.999:
-                                    c['pending_side'] = None
-                                    c['waiting_bb'] = False
-                                    c['bb_wait_candle'] = 0
+                                    self.reset_coin_signal(c)
 
                                 elif elapsed >= CONFIRMATION_TIME:
-                                    if elapsed >= CONFIRMATION_TIME * 3:
+                                    if elapsed >= SIGNAL_TIMEOUT:
                                         print(f"⌛ [{symbol}] SELL timeout")
 
                                         c['pending_side'] = None
@@ -1945,8 +2033,6 @@ class TradingBot:
                                         continue
                                     if price_change >= PRICE_SURGE_THRESHOLD and buy_diff > c['trigger_vol_diff']:
                                         upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
-
-                                        is_green_candle = c['last_close'] > c['last_open'] * 1.003
 
                                         valid_bb = self.is_valid_bb_zone(
                                             'sell',
@@ -2001,22 +2087,55 @@ class TradingBot:
                                         c['waiting_bb'] = False
                                         c['bb_wait_candle'] = 0
 
-                                        if not is_green_candle:
-                                            print(f"❌ [{symbol}] SELL bỏ qua - nến chưa xanh")
-                                            c['pending_side'] = None
-                                            continue
-                                        self.open_position(symbol, 'sell', current_price, buy_diff)
-                                        break
+                                        self.arm_reversal_entry(symbol, c, current_price)
+                                        continue
                                     else:
-                                        c['pending_side'] = None
+                                        self.reset_coin_signal(c)
                             
                             elif c['pending_side'] == 'buy_trigger':
+                                if c.get('waiting_reversal'):
+                                    reversal_elapsed = current_time - c.get('reversal_start_time', current_time)
+                                    reversal_candle = self.get_reversal_5m_candle(symbol)
+                                    if not reversal_candle:
+                                        if reversal_elapsed >= REVERSAL_WAIT_TIMEOUT:
+                                            self.reset_coin_signal(c)
+                                        continue
+                                    reversal_price = reversal_candle['close']
+                                    previous_extreme = self._safe_float(
+                                        c.get('reversal_extreme_price'), reversal_candle['low']
+                                    )
+                                    if previous_extreme <= 0:
+                                        previous_extreme = reversal_candle['low']
+                                    c['reversal_extreme_price'] = min(
+                                        previous_extreme,
+                                        reversal_candle['low']
+                                    )
+                                    trough_price = c['reversal_extreme_price']
+                                    rebound = (
+                                        (reversal_price - trough_price) / trough_price
+                                        if trough_price > 0 else 0.0
+                                    )
+                                    is_reversal_green = (
+                                        reversal_candle['close'] > reversal_candle['open']
+                                    )
+                                    if rebound >= REVERSAL_ENTRY_CALLBACK and is_reversal_green:
+                                        send_telegram(
+                                            f"✅ `{symbol}` xác nhận đảo chiều LONG: "
+                                            f"nến 5m tăng `{rebound*100:.2f}%` từ đáy `{trough_price}`"
+                                        )
+                                        self.open_position(symbol, 'buy', reversal_price, sell_diff)
+                                        self.reset_coin_signal(c)
+                                        break
+
+                                    if reversal_elapsed >= REVERSAL_WAIT_TIMEOUT:
+                                        print(f"⌛ [{symbol}] LONG hết thời gian chờ đảo chiều")
+                                        self.reset_coin_signal(c)
+                                    continue
+
                                 if current_price > c['trigger_price'] * 1.001:
-                                    c['pending_side'] = None
-                                    c['waiting_bb'] = False
-                                    c['bb_wait_candle'] = 0
+                                    self.reset_coin_signal(c)
                                 elif elapsed >= CONFIRMATION_TIME:
-                                    if elapsed >= CONFIRMATION_TIME * 3:
+                                    if elapsed >= SIGNAL_TIMEOUT:
                                         print(f"⌛ [{symbol}] BUY timeout")
 
                                         c['pending_side'] = None
@@ -2025,8 +2144,6 @@ class TradingBot:
                                         continue
                                     if abs(price_change) >= PRICE_SURGE_THRESHOLD and sell_diff > c['trigger_vol_diff']:
                                         upper, middle, lower = self.calculate_bollinger_bands(c['price_history'])
-
-                                        is_red_candle = c['last_close'] < c['last_open'] * 0.997
 
                                         valid_bb = self.is_valid_bb_zone(
                                             'buy',
@@ -2080,14 +2197,10 @@ class TradingBot:
                                         # ===== BB đạt =====
                                         c['waiting_bb'] = False
 
-                                        if not is_red_candle:
-                                            print(f"❌ [{symbol}] BUY bỏ qua - nến chưa đỏ")
-                                            c['pending_side'] = None
-                                            continue
-                                        self.open_position(symbol, 'buy', current_price, sell_diff)
-                                        break
+                                        self.arm_reversal_entry(symbol, c, current_price)
+                                        continue
                                     else:
-                                        c['pending_side'] = None
+                                        self.reset_coin_signal(c)
                     time.sleep(0.01)
 
             # --- ĐỒNG BỘ VỊ THẾ GỘP OKX + GLOBAL TP ---
@@ -2095,9 +2208,11 @@ class TradingBot:
             # Giá lệnh gốc/DCA riêng trong self.positions vẫn được giữ nguyên.
             self.sync_okx_positions_and_manage_global_tp()
 
+            # Khi giá hồi về giá trung bình OKX: chốt Rescue lời > 1 USD,
+            # ghi sổ lỗ còn treo và gom phần còn lại thành một ROOT mới.
+            self.manage_average_price_rescue_reset()
+
             # --- QUẢN LÝ RESCUE TRƯỚC TP RIÊNG ---
-            # Rescue được xét bằng: lời Rescue + lời dương của lệnh gốc/DCA ở coin khác.
-            # Không dùng lời của Rescue khác.
             self.manage_rescue_take_profit()
 
             # --- QUẢN LÝ DCA / RESCUE / TP RIÊNG ---
@@ -2117,29 +2232,18 @@ class TradingBot:
 
                     chain_key = self.get_position_key(symbol, pos['side'])
                     chain = self.rescue_chains.setdefault(chain_key, {
-                        'next_level': 3,
+                        'next_level': 1,
                         'source_position_id': pos['position_id'],
                         'source_slice_index': 0,
-                        'next_order': 3,
+                        'next_order': 1,
+                        'next_rescue_number': 1,
+                        'recovery_debt': self._safe_float(pos.get('recovery_debt')),
                     })
 
-                    # Trước Rescue vẫn mở DCA1 và DCA2 như bình thường.
-                    next_dca_level = (pos.get('dca_count', 0) + 1) * (100 / pos['leverage'])
-                    if (
-                        pos.get('dca_count', 0) < MAX_DCA
-                        and loss_percent >= next_dca_level
-                        and not pos.get('waiting_dca')
-                    ):
-                        pos['waiting_dca'] = True
-                        send_telegram(
-                            f"⚠️ {symbol} đạt ngưỡng DCA {pos.get('dca_count', 0)+1}, chờ mở lệnh DCA riêng"
-                        )
-
-                    # Từ mức DCA3 cũ trở đi chuyển sang Rescue.
+                    # Không còn DCA: mức đi ngược đầu tiên mở RESCUE1.
                     rescue_trigger = chain['next_level'] * (100 / pos['leverage'])
                     if (
                         RESCUE_ENABLED
-                        and pos.get('dca_count', 0) >= MAX_DCA
                         and loss_percent >= rescue_trigger
                         and not chain.get('executing')
                     ):
@@ -2161,15 +2265,16 @@ class TradingBot:
                 unrealized_pnl = self.calculate_virtual_pnl(pos, current_price)
                 exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
                 net_profit = unrealized_pnl - pos.get('entry_fee', 0.0) - exit_fee
-                if net_profit >= TP_NET_PROFIT_USD:
-                    self.close_position(pos, current_price, "Chốt lời TP ròng 2 USD")
+                root_target = max(
+                    TP_NET_PROFIT_USD,
+                    self._safe_float(pos.get('recovery_debt')) + TP_NET_PROFIT_USD
+                )
+                if net_profit >= root_target:
+                    self.close_position(
+                        pos, current_price,
+                        f"TP ROOT: bù lỗ treo + {TP_NET_PROFIT_USD:.2f} USD"
+                    )
                     continue
-
-            # Thực hiện DCA đang chờ. DCA không bị giới hạn bởi slot lệnh gốc.
-            for pos in self.positions[:]:
-                if pos.get('waiting_dca') and not self.active_dca_symbol:
-                    self.execute_dca(pos)
-                    break
 
             if current_time - self.last_status_time >= STATUS_REPORT_INTERVAL:
                 self.send_multi_report()
@@ -2214,13 +2319,8 @@ class TradingBot:
             return self._safe_float(fallback)
 
     def refresh_bot_paused_state(self):
-        """Chỉ dừng săn lệnh mới khi còn chuỗi đã dùng hết số DCA cho phép."""
-        self.bot_paused = any(
-            not pos.get('is_dca_position')
-            and not pos.get('is_rescue_position')
-            and int(pos.get('dca_count', 0)) >= MAX_DCA
-            for pos in self.positions
-        )
+        """RESCUE không làm bot dừng săn lệnh ROOT mới."""
+        self.bot_paused = False
         return self.bot_paused
 
     def get_min_order_amount(self, symbol):
@@ -2304,6 +2404,10 @@ class TradingBot:
                     'unrealized_pnl': self._safe_float(
                         item.get('unrealizedPnl'),
                         self._safe_float(info.get('upl'))
+                    ),
+                    'leverage': self._safe_float(
+                        item.get('leverage'),
+                        self._safe_float(info.get('lever'), LEVERAGE)
                     ),
                     'raw': item,
                 }
@@ -2442,7 +2546,14 @@ class TradingBot:
         estimated_exit_fee = notional * FEE_RATE
         net_pnl = gross_pnl - total_entry_fees - estimated_exit_fee
         net_roe = (net_pnl / total_margin) * 100
-        required_profit = max(GLOBAL_TP_MIN_NET_USD, total_margin * GLOBAL_TP_MARGIN_RATIO)
+        recovery_debt = max(
+            [self._safe_float(p.get('recovery_debt')) for p in group] + [0.0]
+        )
+        required_profit = max(
+            GLOBAL_TP_MIN_NET_USD,
+            total_margin * GLOBAL_TP_MARGIN_RATIO,
+            recovery_debt + TP_NET_PROFIT_USD,
+        )
         if net_pnl < required_profit or net_roe < GLOBAL_TP_MIN_ROE_PERCENT:
             return False
 
@@ -2823,8 +2934,187 @@ class TradingBot:
             key=lambda p: (p.get('chain_order', 999999), p.get('position_id', 0))
         )
 
+    def _record_rescue_close_for_reset(self, key, position_id, virtual_credit):
+        """Ghi lời ảo và lỗ theo giá gộp OKX để tính ROOT mới sau này."""
+        chain = self.rescue_chains.setdefault(key, {})
+        details = self.last_close_accounting.pop(position_id, {})
+        chain['realized_rescue_credit'] = (
+            max(0.0, self._safe_float(chain.get('realized_rescue_credit')))
+            + max(0.0, self._safe_float(virtual_credit))
+        )
+        chain['realized_okx_close_loss'] = (
+            max(0.0, self._safe_float(chain.get('realized_okx_close_loss')))
+            + max(0.0, -self._safe_float(details.get('okx_net_pnl')))
+        )
+        current_debt = max(
+            0.0,
+            self._safe_float(chain.get('recovery_debt'))
+            + self._safe_float(chain.get('realized_okx_close_loss'))
+            - self._safe_float(chain.get('realized_rescue_credit'))
+        )
+        chain_positions = self._get_chain_positions(key)
+        if chain_positions:
+            chain_positions[0]['recovery_debt'] = current_debt
+
+    @synchronized_trading
+    def manage_average_price_rescue_reset(self):
+        """
+        Khi giá chạm/vượt giá trung bình OKX:
+        - TP RESCUE có lời ảo ròng > 1 USD.
+        - Lỗ còn treo = lỗ cắt ROOT + lỗ đóng theo OKX - lời RESCUE bot.
+        - Gom toàn bộ khối lượng thật còn lại thành một ROOT ở giá trung bình OKX.
+        """
+        groups = {}
+        for p in self.positions:
+            key = self.get_position_key(p['symbol'], p['side'])
+            groups.setdefault(key, []).append(p)
+
+        rescue_groups = {
+            key: group for key, group in groups.items()
+            if any(p.get('is_rescue_position') for p in group)
+        }
+        if not rescue_groups:
+            return False
+
+        snapshot = self.fetch_okx_position_snapshot_for_symbols(
+            sorted({key[0] for key in rescue_groups})
+        )
+        if snapshot is None:
+            return False
+
+        changed = False
+        for key, original_group in list(rescue_groups.items()):
+            okx_pos = snapshot.get(key)
+            if not okx_pos:
+                continue
+            okx_avg = self._safe_float(okx_pos.get('entry_price'))
+            current_price = (
+                self._safe_float(okx_pos.get('mark_price'))
+                or self.update_coin_data(key[0])
+            )
+            if okx_avg <= 0 or current_price <= 0:
+                continue
+            reached_average = (
+                current_price >= okx_avg if key[1] == 'buy'
+                else current_price <= okx_avg
+            )
+            if not reached_average:
+                continue
+
+            chain = self.rescue_chains.setdefault(key, {})
+            closed_labels = []
+            for rescue in sorted(
+                [p for p in original_group if p.get('is_rescue_position')],
+                key=lambda p: (p.get('rescue_number', 0), p.get('position_id', 0))
+            ):
+                if rescue not in self.positions:
+                    continue
+                price = self.update_coin_data(rescue['symbol']) or current_price
+                virtual_net = self._estimated_net_pnl(rescue, price)
+                if virtual_net <= RESCUE_AVG_TP_MIN_NET_USD:
+                    continue
+                position_id = rescue.get('position_id')
+                number = rescue.get('rescue_number', '?')
+                result = self.close_position(
+                    rescue, price,
+                    f"Giá hồi về trung bình OKX: TP RESCUE{number} lời trên "
+                    f"{RESCUE_AVG_TP_MIN_NET_USD:.2f} USD"
+                )
+                if rescue not in self.positions:
+                    self._record_rescue_close_for_reset(key, position_id, result)
+                    closed_labels.append(f"RESCUE{number}")
+
+            # Đọc lại OKX sau các lệnh đóng để ROOT mới khớp đúng trạng thái thật.
+            fresh = self.fetch_okx_position_snapshot_for_symbols([key[0]])
+            if fresh is None:
+                continue
+            fresh_pos = fresh.get(key)
+            remaining_group = [
+                p for p in self.positions
+                if self.get_position_key(p['symbol'], p['side']) == key
+            ]
+            if not fresh_pos:
+                for p in remaining_group:
+                    if p in self.positions:
+                        self.positions.remove(p)
+                self.rescue_chains.pop(key, None)
+                self._clear_ignored_residual(key)
+                changed = True
+                continue
+
+            amount = abs(self._safe_float(fresh_pos.get('contracts')))
+            avg = self._safe_float(fresh_pos.get('entry_price'))
+            if amount <= OKX_SYNC_ABS_TOLERANCE or avg <= 0:
+                continue
+
+            cut_loss = max(0.0, self._safe_float(chain.get('recovery_debt')))
+            okx_close_loss = max(
+                0.0, self._safe_float(chain.get('realized_okx_close_loss'))
+            )
+            rescue_credit = max(
+                0.0, self._safe_float(chain.get('realized_rescue_credit'))
+            )
+            remaining_debt = max(0.0, cut_loss + okx_close_loss - rescue_credit)
+            leverage = max(
+                1.0,
+                self._safe_float(fresh_pos.get('leverage'), LEVERAGE)
+            )
+            margin = self.margin_from_fill(
+                key[0], amount, avg, leverage,
+                sum(self._safe_float(p.get('trade_amount')) for p in remaining_group)
+            )
+            remaining_entry_fees = sum(
+                max(0.0, self._safe_float(p.get('entry_fee')))
+                for p in remaining_group
+            )
+
+            for p in remaining_group:
+                if p in self.positions:
+                    self.positions.remove(p)
+            self._clear_ignored_residual(key)
+
+            root_id = self.make_position_id()
+            root = {
+                'position_id': root_id, 'root_id': root_id,
+                'symbol': key[0], 'side': key[1],
+                'entry_price': avg, 'first_entry_price': avg,
+                'amount_coin': amount, 'trade_amount': margin,
+                'original_trade_amount': margin,
+                'entry_fee': remaining_entry_fees,
+                'leverage': leverage, 'dca_count': 0,
+                'waiting_dca': False, 'is_dca_position': False,
+                'is_rescue_position': False, 'chain_order': 0,
+                'recovery_debt': remaining_debt,
+                'tp_trailing_active': False, 'tp_peak_pnl': 0,
+                'tp_trailing_stop_pnl': 0, 'rebuild_count': 0, 'fills': []
+            }
+            self.positions.append(root)
+            self.rescue_chains[key] = {
+                'next_level': 1,
+                'source_position_id': root_id,
+                'source_slice_index': 0,
+                'next_order': 1,
+                'next_rescue_number': 1,
+                'recovery_debt': remaining_debt,
+            }
+            send_telegram(
+                f"🔄 *TẠO ROOT MỚI TẠI GIÁ TRUNG BÌNH OKX*\n"
+                f"📍 `{key[0]}` - `{key[1].upper()}`\n"
+                f"🏦 Giá ROOT mới: `{avg}`\n"
+                f"📦 Khối lượng còn lại: `{amount}`\n"
+                f"✅ Rescue đã TP > $1: `{', '.join(closed_labels) if closed_labels else 'Không có'}`\n"
+                f"✂️ Lỗ cắt nguồn tích lũy: `${cut_loss:.4f}`\n"
+                f"📉 Lỗ đóng theo giá gộp OKX: `${okx_close_loss:.4f}`\n"
+                f"📈 Lời RESCUE bot ghi nhận: `${rescue_credit:.4f}`\n"
+                f"🧾 Lỗ ROOT mới còn gánh: `${remaining_debt:.4f}`\n"
+                f"🎯 TP ROOT mới: lỗ gánh + `${TP_NET_PROFIT_USD:.2f}`\n"
+                f"🛟 Nếu giá đi ngược, chuỗi bắt đầu lại từ RESCUE1."
+            )
+            changed = True
+        return changed
+
     def _promote_rescue_chain(self, key):
-        """Khi nguồn bị cắt hết, dịch hàng đợi: DCA1→gốc, DCA2→DCA1, Rescue1→DCA2..."""
+        """Khi ROOT nguồn hết, đưa RESCUE cũ nhất thành ROOT; không tạo DCA."""
         chain_positions = self._get_chain_positions(key)
         if not chain_positions:
             self.rescue_chains.pop(key, None)
@@ -2839,17 +3129,11 @@ class TradingBot:
                 p.pop('dca_number', None)
                 p.pop('rescue_number', None)
                 p['root_id'] = p['position_id']
-                p['dca_count'] = min(MAX_DCA, max(0, len(chain_positions) - 1))
+                p['dca_count'] = 0
                 p['waiting_dca'] = False
-            elif index <= MAX_DCA:
-                p['is_dca_position'] = True
-                p['is_rescue_position'] = False
-                p['dca_number'] = index
-                p.pop('rescue_number', None)
             else:
                 p['is_dca_position'] = False
                 p['is_rescue_position'] = True
-                p['rescue_number'] = index - MAX_DCA
                 p.pop('dca_number', None)
 
         new_root = chain_positions[0]
@@ -2859,13 +3143,19 @@ class TradingBot:
         chain = self.rescue_chains.setdefault(key, {})
         chain['source_position_id'] = new_root['position_id']
         chain['source_slice_index'] = 0
-        chain['next_order'] = max((p.get('chain_order', 0) for p in chain_positions), default=2) + 1
+        chain['next_order'] = max((p.get('chain_order', 0) for p in chain_positions), default=0) + 1
+        new_root['recovery_debt'] = max(
+            0.0,
+            self._safe_float(chain.get('recovery_debt'))
+            + self._safe_float(chain.get('realized_okx_close_loss'))
+            - self._safe_float(chain.get('realized_rescue_credit'))
+        )
 
         send_telegram(
             f"🔄 *DỊCH CHUỖI RESCUE*\n"
             f"📍 `{key[0]}` - `{key[1].upper()}`\n"
             f"✅ Lệnh đầu hàng đợi đã thành LỆNH GỐC\n"
-            f"✅ Các lệnh phía sau tự dịch xuống DCA1, DCA2 và Rescue kế tiếp"
+            f"✅ Các lệnh phía sau vẫn là RESCUE; chiến lược không còn DCA"
         )
 
     @synchronized_trading
@@ -2940,6 +3230,15 @@ class TradingBot:
                     'ratio': ratio,
                     'slice_index': slice_index,
                 }
+                # Lỗ đã thành hiện thực ngay khi lệnh cắt nguồn khớp, không chờ
+                # order mở RESCUE thành công mới ghi sổ.
+                chain['recovery_debt'] = (
+                    max(0.0, self._safe_float(chain.get('recovery_debt')))
+                    + carried_loss
+                )
+                source['recovery_debt'] = max(
+                    0.0, self._safe_float(chain.get('recovery_debt'))
+                )
 
             rescue_margin = cut_margin * RESCUE_MULTIPLIER
             available_balance = self.get_available_balance()
@@ -2961,7 +3260,7 @@ class TradingBot:
             self.balance -= rfee
 
             rescue_id = self.make_position_id()
-            rescue_number = max([p.get('rescue_number', 0) for p in self._get_chain_positions(key)] + [0]) + 1
+            rescue_number = int(chain.get('next_rescue_number', 1))
             rescue = {
                 'position_id': rescue_id, 'root_id': source.get('root_id', source['position_id']),
                 'symbol': symbol, 'side': source['side'],
@@ -2974,14 +3273,15 @@ class TradingBot:
                 'carried_loss': carried_loss,
                 'rescue_target_net': carried_loss + RESCUE_PROFIT_USD,
                 'realized_support_profit': 0.0,
-                'chain_order': chain.get('next_order', 3),
+                'chain_order': chain.get('next_order', 1),
                 'fills': []
             }
             self.add_fill_event(rescue, 'RESCUE_OPEN', rfill, rescue_margin, f'Mở Rescue {rescue_number}')
             self.positions.append(rescue)
             chain.pop('pending_rescue', None)
             chain['next_order'] = rescue['chain_order'] + 1
-            chain['next_level'] = int(chain.get('next_level', 3)) + 1
+            chain['next_level'] = int(chain.get('next_level', 1)) + 1
+            chain['next_rescue_number'] = rescue_number + 1
 
             send_telegram(
                 f"🛟 *MỞ RESCUE {rescue_number}*\n"
@@ -3006,7 +3306,7 @@ class TradingBot:
             chain['executing'] = False
 
     def manage_rescue_take_profit(self):
-        """Đóng Rescue khi Rescue + lời gốc/DCA khác đủ carried_loss + 2 USD."""
+        """RESCUE1/2 tự TP; từ RESCUE3 được dùng lệnh lời ở coin khác."""
         if self.active_rescue_closing:
             return False
         rescues = [p for p in self.positions if p.get('is_rescue_position')]
@@ -3024,20 +3324,21 @@ class TradingBot:
             realized_support = max(0.0, self._safe_float(rescue.get('realized_support_profit')))
 
             helpers = []
-            for p in self.positions:
-                if p is rescue or p.get('is_rescue_position'):
-                    continue
-                pkey = self.get_position_key(p['symbol'], p['side'])
-                if pkey in rescue_keys:
-                    continue
-                if p['symbol'] == rescue['symbol']:
-                    continue
-                price = self.update_coin_data(p['symbol'])
-                if not price:
-                    continue
-                net = self._estimated_net_pnl(p, price)
-                if net > 0:
-                    helpers.append((net, p, price))
+            if int(rescue.get('rescue_number', 0)) >= RESCUE_EXTERNAL_HELP_FROM_NUMBER:
+                for p in self.positions:
+                    if p is rescue:
+                        continue
+                    pkey = self.get_position_key(p['symbol'], p['side'])
+                    # Không lấy bất kỳ lệnh nào trong chính chuỗi đang được cứu.
+                    if pkey == self.get_position_key(rescue['symbol'], rescue['side']):
+                        continue
+                    price = self.update_coin_data(p['symbol'])
+                    if not price:
+                        continue
+                    net = self._estimated_net_pnl(p, price)
+                    if net > 0:
+                        # ROOT và cả RESCUE đang lời của coin khác đều được hỗ trợ.
+                        helpers.append((net, p, price))
             helpers.sort(key=lambda x: x[0])
 
             selected = []
@@ -3079,17 +3380,22 @@ class TradingBot:
                     )
                     return False
 
+                rescue_position_id = rescue.get('position_id')
+                rescue_key = self.get_position_key(rescue['symbol'], rescue['side'])
                 result = self.close_position(rescue, rprice, 'TP Rescue: lỗ gánh + 2 USD lợi nhuận ròng')
                 if rescue in self.positions:
                     return False
                 actual_total = rescue.get('realized_support_profit', 0.0) + result
+                self._record_rescue_close_for_reset(
+                    rescue_key, rescue_position_id, actual_total
+                )
                 send_telegram(
                     f"🎯 *TP GỘP CHO RESCUE*\n"
                     f"📍 Rescue: `{rescue['symbol']}`\n"
                     f"🎯 Mục tiêu: `${target:.4f}`\n"
                     f"💰 Tổng lời ghi nhận: `${actual_total:.4f}`\n"
-                    f"🤝 Lệnh gốc/DCA hỗ trợ: `{', '.join(closed_helpers) if closed_helpers else 'Không có'}`\n"
-                    f"🚫 Không sử dụng Rescue khác hoặc lệnh thuộc chuỗi Rescue khác"
+                    f"🤝 ROOT/RESCUE coin khác hỗ trợ: `{', '.join(closed_helpers) if closed_helpers else 'Không có'}`\n"
+                    f"📌 Chỉ RESCUE{RESCUE_EXTERNAL_HELP_FROM_NUMBER}+ mới được nhận hỗ trợ ngoài coin"
                 )
                 return True
             finally:
@@ -3151,7 +3457,7 @@ class TradingBot:
             f"💵 Ký quỹ: `${trade_amount:,.2f}`"
         )
         for s in SYMBOLS:
-            self.coins[s]['pending_side'] = None
+            self.reset_coin_signal(self.coins[s])
 
     @synchronized_trading
     def execute_dca(self, pos):
@@ -3699,6 +4005,11 @@ class TradingBot:
             return 0.0
         okx_pos = snapshot.get(key) if snapshot else None
         actual_amount = abs(self._safe_float(okx_pos.get('contracts'))) if okx_pos else 0.0
+        okx_average_before_close = self._safe_float(
+            okx_pos.get('entry_price') if okx_pos else None
+        )
+        if okx_average_before_close <= 0:
+            okx_average_before_close = self._safe_float(pos.get('entry_price'))
 
         # OKX đã hết vị thế nhưng bot còn lệnh ảo: quên dữ liệu ảo, không khóa coin.
         if actual_amount <= OKX_SYNC_ABS_TOLERANCE:
@@ -3769,6 +4080,28 @@ class TradingBot:
             virtual_ratio = min(1.0, virtual_filled_amount / original_virtual_amount)
             allocated_entry_fee = self._safe_float(pos.get('entry_fee')) * virtual_ratio
             real_net_profit = raw_pnl - allocated_entry_fee - exit_fee
+
+            # PnL mà vị thế gộp OKX thực sự ghi nhận cho đúng phần vừa đóng.
+            # Giá vào ảo của RESCUE có thể báo lời trong khi giá gộp OKX báo lỗ.
+            market = exchange.market(symbol)
+            contract_size = self._safe_float(market.get('contractSize'), 1.0)
+            if pos['side'] == 'buy':
+                okx_raw_pnl = (
+                    fill_price - okx_average_before_close
+                ) * virtual_filled_amount * contract_size
+            else:
+                okx_raw_pnl = (
+                    okx_average_before_close - fill_price
+                ) * virtual_filled_amount * contract_size
+            okx_net_pnl = okx_raw_pnl - exit_fee
+            self.last_close_accounting[pos.get('position_id')] = {
+                'virtual_net': real_net_profit,
+                'okx_raw_pnl': okx_raw_pnl,
+                'okx_net_pnl': okx_net_pnl,
+                'okx_average': okx_average_before_close,
+                'fill_price': fill_price,
+                'fill_amount': virtual_filled_amount,
+            }
 
             self.add_fill_event(pos, 'CLOSE', fill, -self._safe_float(pos.get('trade_amount')), reason)
             self.balance += raw_pnl - exit_fee
