@@ -18,7 +18,7 @@ LEVERAGE = 20 # đòn bẩy
 DEFAULT_TRADE_AMOUNT = 10 # vốn vào lệnh
 INITIAL_BALANCE = 500 # tổng vốn
 CHECK_INTERVAL = 5 # quét giá
-WARMUP_PERIOD = 3000000000000000000000000000 # tích dữ liệu giá
+WARMUP_PERIOD = 300 # tích dữ liệu giá
 VOL_WINDOW_SIZE = 1000 # cửa sổ tính volume theo chiến lược gốc
 OHLCV_CACHE_SECONDS = 30 # nến 1h không cần tải lại cho mỗi lần đọc giá
 REVERSAL_5M_CACHE_SECONDS = 5 # chỉ tải nến 5m cho coin đang chờ đảo chiều
@@ -27,19 +27,21 @@ VOL_DIFF_THRESHOLD = 1.00 # chênh lệch %
 CONFIRMATION_TIME = 11 # thời gian tối thiểu xác nhận cú đẩy
 SIGNAL_TIMEOUT = 59 * 60 # tối đa 59 phút để đủ surge + volume + Bollinger
 PRICE_SURGE_THRESHOLD = 0.002 # mức tăng giá tối thiểu
-REVERSAL_ENTRY_CALLBACK = 0.010 # hồi ngược 0.4% từ đỉnh/đáy mới vào lệnh
+REVERSAL_ENTRY_CALLBACK = 0.004 # hồi ngược 0.4% từ đỉnh/đáy mới vào lệnh
 REVERSAL_WAIT_TIMEOUT = 15 * 60 # tối đa 15 phút chờ đảo chiều thật
 STATUS_REPORT_INTERVAL = 1800 # thời gian gửi báo cáo
 FEE_RATE = 0.0005 # 0.05% phí
 MAX_POSITIONS = 10 # số lệnh tối đa cùng lúc
-MAX_DCA = 0 # chiến lược mới: bỏ DCA1/DCA2, đi thẳng từ ROOT sang RESCUE
-TP_NET_PROFIT_USD = 2.0
-RESCUE_ENABLED = True
-RESCUE_PROFIT_USD = 2.0
-RESCUE_SOURCE_SLICES = 3
-RESCUE_MULTIPLIER = 3.0
-RESCUE_AVG_TP_MIN_NET_USD = 1.0
-RESCUE_EXTERNAL_HELP_FROM_NUMBER = 3
+MAX_DCA = 0
+INDIVIDUAL_ROOT_TP_ENABLED = True
+TP_NET_PROFIT_USD = 2.0 # TP ròng từng ROOT sau phí
+ROOT_SL_NET_LOSS_USD = 1.5 # SL ròng từng ROOT sau phí
+RESCUE_ENABLED = False # đã bỏ toàn bộ cơ chế RESCUE
+RESCUE_TP_ENABLED = False
+RESCUE_PROFIT_USD = 0.0
+MARGIN_ADD_ENABLED = False # đã bỏ cơ chế âm 20% bơm thêm 2 USD
+MARGIN_ADD_LOSS_STEP_PERCENT = 20.0 # mỗi âm thêm 20% ROE
+MARGIN_ADD_USD = 2.0 # bơm thêm 2 USD ký quỹ vào chính ROOT
 MARGIN_MODE = "cross" # isolated = Cô lập trên OKX, cross = Chéo
 
 # --- KIỂM TRA MỞ/ĐÓNG LỆNH THẬT QUA TELEGRAM ---
@@ -75,10 +77,9 @@ OKX_SYNC_INTERVAL = 15
 OKX_SYNC_REL_TOLERANCE = 0.03  # cho phép lệch 3% do precision/khớp lệnh
 OKX_SYNC_ABS_TOLERANCE = 1e-8
 OKX_SYNC_NOTIFY_COOLDOWN = 900
-GLOBAL_TP_ENABLED = True
-GLOBAL_TP_MIN_NET_USD = 2.0
-GLOBAL_TP_MARGIN_RATIO = 0.10  # hoặc tối thiểu 10% tổng ký quỹ coin
-GLOBAL_TP_MIN_ROE_PERCENT = 10.0
+GLOBAL_TP_ENABLED = False # TP/SL áp dụng độc lập cho từng ROOT
+GLOBAL_TP_MIN_NET_USD = 0.0
+GLOBAL_TP_MARGIN_RATIO = 0.50 # TP khi lời ròng đạt 50% tổng ký quỹ coin
 
 # --- BƠM LẠI LỆNH ĐÃ BỊ CẮT NHỎ ---
 REBUILD_TRIGGER_TRADE_AMOUNT = 2 # khi ký quỹ lệnh còn <= 2$ thì xét bơm lại
@@ -184,6 +185,7 @@ class TradingBot:
         self.test_order_running = False
         self.recovery_session = None
         self.startup_position_check_done = False
+        self.startup_unmanaged_symbols = set()
         
         self.coins = {}
         for symbol in SYMBOLS:
@@ -273,6 +275,9 @@ class TradingBot:
 
                 elif text in ('HUY KHOI PHUC', 'HỦY KHÔI PHỤC'):
                     active_bot.cancel_okx_recovery()
+
+                elif text in ('BO QUA', 'BỎ QUA'):
+                    active_bot.ignore_startup_okx_positions()
 
                 elif active_bot.recovery_session is not None:
                     active_bot.handle_okx_recovery_answer(text)
@@ -504,14 +509,83 @@ class TradingBot:
             if abs(self._safe_float(item.get('contracts'))) > OKX_SYNC_ABS_TOLERANCE
         ]
         if active and not self.positions:
+            self.startup_unmanaged_symbols = {
+                item.get('symbol')
+                for item in active
+                if item.get('symbol')
+            }
             self.view_mode = True
             self.search_paused = True
             send_telegram(
                 "🛡 *PHÁT HIỆN VỊ THẾ OKX KHI BOT VỪA KHỞI ĐỘNG*\n"
                 f"📦 Có `{len(active)}` vị thế coin/chiều nhưng bộ nhớ lệnh riêng đang trống.\n"
                 "👁 Bot đã tự khóa ở CHẾ ĐỘ XEM và không săn lệnh mới.\n"
-                "➡️ Nhắn `KHOI PHUC` để dựng lại một ROOT theo giá trung bình OKX."
+                "➡️ Nhắn `KHOI PHUC` để bot tiếp quản bằng ROOT.\n"
+                "➡️ Hoặc nhắn `BO QUA` để giữ nguyên lệnh đánh tay, "
+                "đưa các coin đó vào danh sách đen và chạy bot với coin khác."
             )
+        return True
+
+    @synchronized_trading
+    def ignore_startup_okx_positions(self):
+        """Bỏ qua vị thế tay trên OKX, blacklist coin và cho bot chạy coin khác."""
+        if self.positions or not self.view_mode or not self.startup_unmanaged_symbols:
+            send_telegram(
+                "ℹ️ `BO QUA` chỉ dùng khi bot vừa phát hiện vị thế OKX "
+                "chưa được quản lý và đang tự khóa ở CHẾ ĐỘ XEM."
+            )
+            return False
+
+        try:
+            raw_positions = exchange.fetch_positions()
+        except Exception as e:
+            send_telegram(
+                f"❌ Không kiểm tra lại được vị thế OKX:\n`{e}`\n"
+                "✅ Bot vẫn ở CHẾ ĐỘ XEM và chưa bỏ qua coin nào."
+            )
+            return False
+
+        active_symbols = {
+            item.get('symbol')
+            for item in (raw_positions or [])
+            if (
+                item.get('symbol')
+                and abs(self._safe_float(item.get('contracts')))
+                > OKX_SYNC_ABS_TOLERANCE
+            )
+        }
+        # Lấy trạng thái mới nhất: nếu người dùng vừa mở thêm vị thế tay trong
+        # lúc bot đang chờ, các coin mới đó cũng phải được bỏ qua và blacklist.
+        targets = active_symbols
+        if not targets:
+            send_telegram(
+                "ℹ️ Các vị thế OKX được phát hiện lúc khởi động hiện đã đóng hết.\n"
+                "Bot sẽ thoát CHẾ ĐỘ XEM và chạy bình thường."
+            )
+        else:
+            for symbol in targets:
+                self.blacklist.add(self.symbol_base_name(symbol))
+                coin_state = self.coins.get(symbol)
+                if coin_state:
+                    self.reset_coin_signal(coin_state)
+
+        self.recovery_session = None
+        self.startup_unmanaged_symbols.clear()
+        self.view_mode = False
+        self.search_paused = False
+        self.bot_paused = False
+
+        ignored = ', '.join(
+            f"`{self.symbol_base_name(symbol)}`"
+            for symbol in sorted(targets)
+        ) or "Không còn coin mở"
+        send_telegram(
+            "✅ *ĐÃ BỎ QUA VỊ THẾ ĐÁNH TAY*\n"
+            f"🚫 Coin đưa vào danh sách đen: {ignored}\n"
+            "🖐 Bot không tạo ROOT, không TP/SL và không đóng các vị thế này.\n"
+            "▶️ Bot đã chạy và chỉ săn những coin khác.\n"
+            "📌 Danh sách đen lưu trong RAM; bot restart thì cần `BO QUA` lại."
+        )
         return True
 
     def _send_next_recovery_question(self):
@@ -821,6 +895,8 @@ class TradingBot:
                         'fills': [],
                         'recovered_from_okx': True,
                         'recovery_debt': 0.0,
+                        'margin_add_count': 0,
+                        'next_margin_add_roe': MARGIN_ADD_LOSS_STEP_PERCENT,
                     }
                     if index > 0:
                         pos['dca_number'] = index
@@ -2200,71 +2276,28 @@ class TradingBot:
             # Giá lệnh gốc/DCA riêng trong self.positions vẫn được giữ nguyên.
             self.sync_okx_positions_and_manage_global_tp()
 
-            # Khi giá hồi về giá trung bình OKX: chốt Rescue lời > 1 USD,
-            # ghi sổ lỗ còn treo và gom phần còn lại thành một ROOT mới.
-            self.manage_average_price_rescue_reset()
-
-            # --- QUẢN LÝ RESCUE TRƯỚC TP RIÊNG ---
-            self.manage_rescue_take_profit()
-
-            # --- QUẢN LÝ DCA / RESCUE / TP RIÊNG ---
+            # --- QUẢN LÝ TP/SL RÒNG ĐỘC LẬP CHO TỪNG ROOT ---
             for pos in self.positions[:]:
                 symbol = pos['symbol']
-                current_price = self.update_coin_data(symbol)
+                current_price = self.get_live_position_price(symbol)
                 if not current_price:
                     continue
 
-                # Chỉ lệnh gốc hiện tại điều khiển chuỗi DCA/Rescue.
-                if (not pos.get('is_dca_position') and not pos.get('is_rescue_position')):
-                    first_price = pos['first_entry_price']
-                    if pos['side'] == 'buy':
-                        loss_percent = ((first_price - current_price) / first_price) * 100
-                    else:
-                        loss_percent = ((current_price - first_price) / first_price) * 100
-
-                    chain_key = self.get_position_key(symbol, pos['side'])
-                    chain = self.rescue_chains.setdefault(chain_key, {
-                        'next_level': 1,
-                        'source_position_id': pos['position_id'],
-                        'source_slice_index': 0,
-                        'next_order': 1,
-                        'next_rescue_number': 1,
-                        'recovery_debt': self._safe_float(pos.get('recovery_debt')),
-                    })
-
-                    # Không còn DCA: mức đi ngược đầu tiên mở RESCUE1.
-                    rescue_trigger = chain['next_level'] * (100 / pos['leverage'])
-                    if (
-                        RESCUE_ENABLED
-                        and loss_percent >= rescue_trigger
-                        and not chain.get('executing')
-                    ):
-                        self.execute_rescue(chain_key, current_price)
-
-                # Khi coin đang có Rescue, lệnh gốc/DCA không TP riêng;
-                # lợi nhuận dương của chúng được giữ để cộng cho Rescue.
-                coin_has_rescue = any(
-                    p.get('is_rescue_position') for p in self.positions
-                    if p['symbol'] == symbol and p['side'] == pos['side']
-                )
-                if coin_has_rescue:
+                # Chỉ quản lý TP/SL độc lập cho ROOT. RESCUE/DCA/bơm thêm đã tắt.
+                if pos.get('is_dca_position') or pos.get('is_rescue_position'):
                     continue
 
-                # Rescue không TP riêng ở đây; manage_rescue_take_profit xử lý mục tiêu carried_loss + 2 USD.
-                if pos.get('is_rescue_position'):
-                    continue
-
-                unrealized_pnl = self.calculate_virtual_pnl(pos, current_price)
-                exit_fee = (pos['trade_amount'] * pos['leverage']) * FEE_RATE
-                net_profit = unrealized_pnl - pos.get('entry_fee', 0.0) - exit_fee
-                root_target = max(
-                    TP_NET_PROFIT_USD,
-                    self._safe_float(pos.get('recovery_debt')) + TP_NET_PROFIT_USD
-                )
-                if net_profit >= root_target:
+                net_profit = self._estimated_net_pnl(pos, current_price)
+                if INDIVIDUAL_ROOT_TP_ENABLED and net_profit >= TP_NET_PROFIT_USD:
                     self.close_position(
                         pos, current_price,
-                        f"TP ROOT: bù lỗ treo + {TP_NET_PROFIT_USD:.2f} USD"
+                        f"TP ROOT ròng +{TP_NET_PROFIT_USD:.2f} USD sau phí"
+                    )
+                    continue
+                if net_profit <= -ROOT_SL_NET_LOSS_USD:
+                    self.close_position(
+                        pos, current_price,
+                        f"SL ROOT ròng -{ROOT_SL_NET_LOSS_USD:.2f} USD sau phí"
                     )
                     continue
 
@@ -2277,6 +2310,19 @@ class TradingBot:
 
     def get_position_key(self, symbol, side):
         return (symbol, side)
+
+    def get_live_position_price(self, symbol):
+        """Giá ticker mới nhất dùng riêng cho TP/SL; không dùng cache nến 1h."""
+        try:
+            ticker = exchange.fetch_ticker(symbol) or {}
+            price = self._safe_float(
+                ticker.get('last'),
+                self._safe_float(ticker.get('close'))
+            )
+            return price if price > 0 else None
+        except Exception as e:
+            print(f"⚠️ Không lấy được giá ticker TP/SL {symbol}: {e}")
+            return None
 
     def _safe_float(self, value, default=0.0):
         try:
@@ -2519,9 +2565,6 @@ class TradingBot:
     @synchronized_trading
     def try_global_tp_for_group(self, key, group, okx_pos):
         """Nếu vị thế gộp thật đã lời đủ thì đóng lần lượt, lệnh cuối dọn sạch vị thế thật."""
-        if any(p.get('is_rescue_position') for p in group):
-            return False
-
         total_margin = sum(max(0.0, self._safe_float(p.get('trade_amount'))) for p in group)
         if total_margin <= 0:
             return False
@@ -2546,7 +2589,7 @@ class TradingBot:
             total_margin * GLOBAL_TP_MARGIN_RATIO,
             recovery_debt + TP_NET_PROFIT_USD,
         )
-        if net_pnl < required_profit or net_roe < GLOBAL_TP_MIN_ROE_PERCENT:
+        if net_pnl < required_profit:
             return False
 
         symbol, side = key
@@ -2554,7 +2597,12 @@ class TradingBot:
         realized_total = 0.0
         ordered_group = sorted(
             [p for p in group if p in self.positions],
-            key=lambda p: (p.get('is_dca_position', False), p.get('dca_number', 0), p.get('position_id', 0))
+            # Đóng RESCUE trước và để ROOT cuối cùng dọn toàn bộ phần dư OKX.
+            key=lambda p: (
+                not p.get('is_rescue_position', False),
+                p.get('rescue_number', 0),
+                p.get('position_id', 0)
+            )
         )
         for p in ordered_group:
             if p not in self.positions:
@@ -2916,7 +2964,14 @@ class TradingBot:
     def _estimated_net_pnl(self, pos, current_price):
         """PnL ròng ước tính sau phí vào và phí đóng."""
         gross = self.calculate_virtual_pnl(pos, current_price)
-        exit_fee = pos.get('trade_amount', 0.0) * pos.get('leverage', LEVERAGE) * FEE_RATE
+        market = exchange.market(pos['symbol'])
+        contract_size = self._safe_float(market.get('contractSize'), 1.0)
+        exit_notional = (
+            abs(self._safe_float(pos.get('amount_coin')))
+            * self._safe_float(current_price)
+            * contract_size
+        )
+        exit_fee = exit_notional * FEE_RATE
         return gross - pos.get('entry_fee', 0.0) - exit_fee
 
     def _get_chain_positions(self, key):
@@ -3152,7 +3207,7 @@ class TradingBot:
 
     @synchronized_trading
     def execute_rescue(self, key, current_price):
-        """Cắt 1/3 nguồn và mở Rescue bằng 3 lần ký quỹ phần vừa cắt."""
+        """Giữ nguyên ROOT và mở thêm một RESCUE cùng mức ký quỹ ROOT."""
         chain = self.rescue_chains.get(key)
         if not chain or chain.get('executing'):
             return False
@@ -3160,90 +3215,27 @@ class TradingBot:
         try:
             source = next((p for p in self.positions if p.get('position_id') == chain.get('source_position_id')), None)
             if source is None:
-                self._promote_rescue_chain(key)
                 return False
 
             symbol = source['symbol']
-            old_amount = self._safe_float(source.get('amount_coin'))
-            old_margin = self._safe_float(source.get('trade_amount'))
-            pending = chain.get('pending_rescue')
-            if not pending and (old_amount <= 0 or old_margin <= 0):
-                self.remove_position_from_memory(source)
-                self._promote_rescue_chain(key)
+            source_margin = self._safe_float(source.get('trade_amount'))
+            if self._safe_float(source.get('amount_coin')) <= 0 or source_margin <= 0:
                 return False
 
-            if pending:
-                # Lát nguồn đã cắt ở vòng trước nhưng order mở Rescue lỗi.
-                # Thử lại đúng Rescue đó, tuyệt đối không cắt thêm nguồn.
-                fill_price = self._safe_float(pending.get('fill_price'), current_price)
-                cut_margin = self._safe_float(pending.get('cut_margin'))
-                carried_loss = self._safe_float(pending.get('carried_loss'))
-                ratio = self._safe_float(pending.get('ratio'))
-                slice_index = int(pending.get('slice_index', 0))
-            else:
-                # Cố định mỗi lát theo 1/3 khối lượng lúc bắt đầu cắt nguồn.
-                if chain.get('source_slice_amount', 0) <= 0:
-                    chain['source_slice_amount'] = old_amount / RESCUE_SOURCE_SLICES
-                slice_index = int(chain.get('source_slice_index', 0))
-                raw_cut_amount = old_amount if slice_index >= RESCUE_SOURCE_SLICES - 1 else min(old_amount, chain['source_slice_amount'])
-                cut_amount = self._safe_float(exchange.amount_to_precision(symbol, raw_cut_amount))
-                if cut_amount <= 0:
-                    return False
-
-                close_side = 'sell' if source['side'] == 'buy' else 'buy'
-                clid = self.make_client_order_id('RSCUT', source.get('position_id'))
-                order = exchange.create_market_order(symbol, close_side, cut_amount, params={
-                    'tdMode': MARGIN_MODE, 'reduceOnly': True,
-                    'posSide': 'long' if source['side'] == 'buy' else 'short',
-                    'clOrdId': clid,
-                })
-                fill = self.resolve_order_fill(order, symbol, current_price, cut_amount)
-                fill_amount = min(fill['amount'] or cut_amount, old_amount)
-                fill_price = fill['price'] or current_price
-                ratio = min(1.0, fill_amount / old_amount)
-                realized = self.calculate_realized_pnl_from_fill(source, fill_price, fill_amount)
-                allocated_entry_fee = source.get('entry_fee', 0.0) * ratio
-                exit_fee = fill['fee'] if fill['fee'] > 0 else old_margin * ratio * source['leverage'] * FEE_RATE
-                carried_loss = max(0.0, -(realized - allocated_entry_fee - exit_fee))
-                cut_margin = old_margin * ratio
-
-                source['amount_coin'] = max(0.0, old_amount - fill_amount)
-                source['trade_amount'] = max(0.0, old_margin - cut_margin)
-                source['entry_fee'] = max(0.0, source.get('entry_fee', 0.0) - allocated_entry_fee)
-                self.balance += realized - exit_fee
-
-                # Ghi nhận lát cắt ngay sau khi fill đóng đã thành công. Nếu mở
-                # Rescue lỗi, vòng sau dùng pending_rescue thay vì cắt thêm.
-                chain['source_slice_index'] = slice_index + 1
-                chain['pending_rescue'] = {
-                    'fill_price': fill_price,
-                    'cut_margin': cut_margin,
-                    'carried_loss': carried_loss,
-                    'ratio': ratio,
-                    'slice_index': slice_index,
-                }
-                # Lỗ đã thành hiện thực ngay khi lệnh cắt nguồn khớp, không chờ
-                # order mở RESCUE thành công mới ghi sổ.
-                chain['recovery_debt'] = (
-                    max(0.0, self._safe_float(chain.get('recovery_debt')))
-                    + carried_loss
-                )
-                source['recovery_debt'] = max(
-                    0.0, self._safe_float(chain.get('recovery_debt'))
-                )
-
-            rescue_margin = cut_margin * RESCUE_MULTIPLIER
             available_balance = self.get_available_balance()
+            rescue_margin = min(source_margin, available_balance)
             if rescue_margin <= 0 or available_balance <= 0:
-                send_telegram(f"⚠️ `{symbol}` đã cắt nguồn nhưng không đủ vốn mở Rescue.")
+                send_telegram(
+                    f"⚠️ `{symbol}` không đủ vốn khả dụng để mở RESCUE; "
+                    "ROOT vẫn được giữ nguyên."
+                )
                 return False
-            rescue_margin = min(available_balance, rescue_margin)
             entry_order, lev, req_amount, est_fee = self.create_entry_order_with_leverage_fallback(
-                symbol=symbol, side=source['side'], price=fill_price,
+                symbol=symbol, side=source['side'], price=current_price,
                 trade_amount=rescue_margin, preferred_leverage=source.get('leverage', LEVERAGE)
             )
-            rfill = self.resolve_order_fill(entry_order, symbol, fill_price, req_amount)
-            rprice = rfill['price'] or fill_price
+            rfill = self.resolve_order_fill(entry_order, symbol, current_price, req_amount)
+            rprice = rfill['price'] or current_price
             ramount = rfill['amount'] or req_amount
             rescue_margin = self.margin_from_fill(
                 symbol, ramount, rprice, lev, rescue_margin
@@ -3262,8 +3254,8 @@ class TradingBot:
                 'leverage': lev, 'dca_count': 0, 'waiting_dca': False,
                 'is_dca_position': False, 'is_rescue_position': True,
                 'rescue_number': rescue_number,
-                'carried_loss': carried_loss,
-                'rescue_target_net': carried_loss + RESCUE_PROFIT_USD,
+                'carried_loss': 0.0,
+                'rescue_target_net': RESCUE_PROFIT_USD,
                 'realized_support_profit': 0.0,
                 'chain_order': chain.get('next_order', 1),
                 'fills': []
@@ -3278,18 +3270,10 @@ class TradingBot:
             send_telegram(
                 f"🛟 *MỞ RESCUE {rescue_number}*\n"
                 f"📍 `{symbol}`\n"
-                f"✂️ Đã cắt `{ratio*100:.1f}%` phần nguồn, lỗ ròng gánh: `${carried_loss:.4f}`\n"
+                f"✅ ROOT được giữ nguyên, không cắt khối lượng\n"
                 f"💵 Ký quỹ Rescue: `${rescue_margin:.4f}`\n"
-                f"🎯 TP Rescue cần: `${carried_loss + RESCUE_PROFIT_USD:.4f}` = lỗ gánh + `${RESCUE_PROFIT_USD:.2f}`"
+                f"ℹ️ TP riêng RESCUE đã tắt; vị thế được quản lý bằng Global TP toàn coin"
             )
-
-            # Nguồn đã hết sau 3 lát: xóa và dịch toàn bộ hàng đợi xuống một bậc.
-            remaining_precision = self._safe_float(exchange.amount_to_precision(symbol, source.get('amount_coin', 0.0)))
-            if chain['source_slice_index'] >= RESCUE_SOURCE_SLICES or remaining_precision <= 0:
-                if source in self.positions:
-                    self.positions.remove(source)
-                chain['source_slice_amount'] = 0.0
-                self._promote_rescue_chain(key)
             return True
         except Exception as e:
             send_telegram(f"❌ Lỗi Rescue `{key[0]}`:\n`{e}`")
@@ -3372,15 +3356,13 @@ class TradingBot:
                     )
                     return False
 
-                rescue_position_id = rescue.get('position_id')
-                rescue_key = self.get_position_key(rescue['symbol'], rescue['side'])
-                result = self.close_position(rescue, rprice, 'TP Rescue: lỗ gánh + 2 USD lợi nhuận ròng')
+                result = self.close_position(
+                    rescue, rprice,
+                    f'TP RESCUE ròng {RESCUE_PROFIT_USD:.2f} USD'
+                )
                 if rescue in self.positions:
                     return False
                 actual_total = rescue.get('realized_support_profit', 0.0) + result
-                self._record_rescue_close_for_reset(
-                    rescue_key, rescue_position_id, actual_total
-                )
                 send_telegram(
                     f"🎯 *TP GỘP CHO RESCUE*\n"
                     f"📍 Rescue: `{rescue['symbol']}`\n"
@@ -3424,6 +3406,8 @@ class TradingBot:
                 'is_rescue_position': False, 'chain_order': 0,
                 'tp_trailing_active': False, 'tp_peak_pnl': 0,
                 'tp_trailing_stop_pnl': 0, 'rebuild_count': 0,
+                'margin_add_count': 0,
+                'next_margin_add_roe': MARGIN_ADD_LOSS_STEP_PERCENT,
                 'fills': []
             }
             self.add_fill_event(pos, 'OPEN', fill, trade_amount, 'Mở lệnh gốc')
@@ -3446,10 +3430,106 @@ class TradingBot:
             f"⚙️ Đòn bẩy thực tế: `x{current_leverage}`\n"
             f"📊 Vol chênh lệch: `+{vol_diff*100:.1f}%` 🔥\n"
             f"💸 Phí mở lấy từ OKX/ước tính: `${entry_fee:.6f}`\n"
-            f"💵 Ký quỹ: `${trade_amount:,.2f}`"
+            f"💵 Ký quỹ: `${trade_amount:,.2f}`\n"
+            f"🎯 TP ròng sau phí: `+${TP_NET_PROFIT_USD:.2f}`\n"
+            f"🛑 SL ròng sau phí: `-${ROOT_SL_NET_LOSS_USD:.2f}`"
         )
         for s in SYMBOLS:
             self.reset_coin_signal(self.coins[s])
+
+    @synchronized_trading
+    def execute_margin_add(self, pos, current_price, reached_roe):
+        """Thêm 2 USD cùng chiều vào ROOT khi vượt từng mốc âm 20% ROE."""
+        if (
+            pos not in self.positions
+            or pos.get('is_dca_position')
+            or pos.get('is_rescue_position')
+            or pos.get('margin_add_running')
+        ):
+            return False
+
+        available_balance = self.get_available_balance()
+        if available_balance + 1e-9 < MARGIN_ADD_USD:
+            send_telegram(
+                f"⚠️ `{pos['symbol']}` đã chạm mốc âm `{reached_roe:.0f}%` "
+                f"nhưng vốn khả dụng `${available_balance:.4f}` chưa đủ "
+                f"để bơm `${MARGIN_ADD_USD:.2f}`.\n"
+                "✅ Bot chưa tăng mốc và sẽ thử lại."
+            )
+            return False
+
+        pos['margin_add_running'] = True
+        try:
+            symbol = pos['symbol']
+            order, actual_leverage, requested_amount, estimated_fee = (
+                self.create_entry_order_with_leverage_fallback(
+                    symbol=symbol,
+                    side=pos['side'],
+                    price=current_price,
+                    trade_amount=MARGIN_ADD_USD,
+                    preferred_leverage=pos.get('leverage', LEVERAGE)
+                )
+            )
+            fill = self.resolve_order_fill(
+                order, symbol, current_price, requested_amount
+            )
+            fill_price = self._safe_float(fill.get('price'), current_price)
+            fill_amount = self._safe_float(fill.get('amount'), requested_amount)
+            if fill_amount <= 0:
+                raise RuntimeError("Không xác minh được khối lượng bơm đã khớp.")
+
+            old_amount = self._safe_float(pos.get('amount_coin'))
+            actual_margin = self.margin_from_fill(
+                symbol, fill_amount, fill_price, actual_leverage, MARGIN_ADD_USD
+            )
+            fee = self._safe_float(fill.get('fee'))
+            if fee <= 0:
+                fee = actual_margin * actual_leverage * FEE_RATE
+
+            # entry_price chạy theo giá trung bình; first_entry_price giữ nguyên
+            # để các mốc âm 20%, 40%, 60%... không bị dịch chuyển sau mỗi lần bơm.
+            pos['entry_price'] = self.weighted_entry_after_add(
+                pos['entry_price'], old_amount, fill_price, fill_amount
+            )
+            pos['amount_coin'] = old_amount + fill_amount
+            pos['trade_amount'] = (
+                self._safe_float(pos.get('trade_amount')) + actual_margin
+            )
+            pos['original_trade_amount'] = (
+                self._safe_float(pos.get('original_trade_amount')) + actual_margin
+            )
+            pos['entry_fee'] = self._safe_float(pos.get('entry_fee')) + fee
+            pos['leverage'] = actual_leverage
+            pos['margin_add_count'] = int(pos.get('margin_add_count', 0)) + 1
+            pos['next_margin_add_roe'] = (
+                reached_roe + MARGIN_ADD_LOSS_STEP_PERCENT
+            )
+            self.add_fill_event(
+                pos, 'MARGIN_ADD', fill, actual_margin,
+                f"Bơm 2 USD tại mốc âm {reached_roe:.0f}% ROE"
+            )
+            self.balance -= fee
+
+            send_telegram(
+                f"➕ *BƠM THÊM KÝ QUỸ ROOT*\n"
+                f"📍 `{symbol}` - `{pos['side'].upper()}`\n"
+                f"📉 Mốc vừa chạm: âm `{reached_roe:.0f}%`\n"
+                f"💵 Ký quỹ thêm theo fill: `${actual_margin:.4f}`\n"
+                f"💰 Giá khớp: `{fill_price}`\n"
+                f"🏦 Giá trung bình ROOT mới: `{pos['entry_price']}`\n"
+                f"⏭ Mốc bơm tiếp theo: âm `{pos['next_margin_add_roe']:.0f}%`\n"
+                f"🎯 Global TP: lời ròng 50% tổng ký quỹ."
+            )
+            return True
+        except Exception as e:
+            send_telegram(
+                f"❌ Lỗi bơm thêm `${MARGIN_ADD_USD:.2f}` cho "
+                f"`{pos.get('symbol')}`:\n`{e}`\n"
+                "✅ Bot chưa tăng mốc và sẽ thử lại."
+            )
+            return False
+        finally:
+            pos['margin_add_running'] = False
 
     @synchronized_trading
     def execute_dca(self, pos):
